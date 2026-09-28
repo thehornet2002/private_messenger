@@ -3,7 +3,7 @@ import json
 import time
 from aiohttp import web
 from .config import load_config, save_config
-from .server import GLOBAL_MEMORY_STORE
+from .server import GLOBAL_DISK_STORE
 from .telegram_server_bot import GLOBAL_TELEGRAM_BOT
 
 SERVER_ADMIN_HTML = """<!DOCTYPE html>
@@ -74,7 +74,7 @@ SERVER_ADMIN_HTML = """<!DOCTYPE html>
             </div>
             <div class="badge-live">
                 <div class="dot"></div>
-                <span>سرور فعال و بدون لاگ (RAM Only)</span>
+                <span>سرور فعال (ذخیره‌سازی دیسک با انقضای ۴ ساعته)</span>
             </div>
         </header>
 
@@ -85,7 +85,7 @@ SERVER_ADMIN_HTML = """<!DOCTYPE html>
                 <span class="stat-val" id="stat-queries">0</span>
             </div>
             <div class="stat-card">
-                <span class="stat-label">پیام‌های جابه‌جاشده در حافظه</span>
+                <span class="stat-label">پیام‌های ذخیره‌شده (بازه ۴ ساعت اخیر)</span>
                 <span class="stat-val" id="stat-msgs">0</span>
             </div>
             <div class="stat-card">
@@ -93,7 +93,7 @@ SERVER_ADMIN_HTML = """<!DOCTYPE html>
                 <span class="stat-val" id="stat-traffic">0 KB</span>
             </div>
             <div class="stat-card">
-                <span class="stat-label">کانال‌های فعال در RAM (موقت)</span>
+                <span class="stat-label">کانال‌های فعال روی سرور</span>
                 <span class="stat-val" id="stat-tags">0</span>
             </div>
             <div class="stat-card">
@@ -103,7 +103,7 @@ SERVER_ADMIN_HTML = """<!DOCTYPE html>
         </div>
 
         <div class="notice">
-            🔒 <strong>معماری امنیت مطلق:</strong> هیچ اطلاعاتی روی دیسک سرور ذخیره نمی‌شود. تمام پیام‌ها در RAM به عنوان صف فرار (In-Memory Ring Buffer) نگهداری شده و بلافاصله پس از تحویل منقضی می‌شوند. تاریخچه پیام‌ها صرفاً در کلاینت کاربران ذخیره می‌گردد.
+            💾 <strong>پایداری روی دیسک با پاک‌سازی خودکار:</strong> پیام‌ها و فایل‌های ارسالی تا سقف حجم تعیین‌شده به مدت ۴ ساعت روی دیسک سرور در پایگاه‌داده امن ذخیره می‌شوند و بسته‌های قدیمی‌تر از ۴ ساعت به طور مداوم و خودکار حذف می‌گردند.
         </div>
 
         <!-- Telegram Kurigram Setup Wizard -->
@@ -375,7 +375,7 @@ class ServerAdminApp:
         return web.Response(text=SERVER_ADMIN_HTML, content_type="text/html")
 
     async def stats_handler(self, request):
-        stats = GLOBAL_MEMORY_STORE.stats.copy()
+        stats = GLOBAL_DISK_STORE.stats.copy()
         stats["tg_connected"] = GLOBAL_TELEGRAM_BOT.is_connected
         return web.json_response(stats)
 

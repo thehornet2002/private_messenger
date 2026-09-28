@@ -1,14 +1,14 @@
 import asyncio
 import socket
+import sqlite3
 import time
 import math
-from collections import deque
 from pathlib import Path
 from typing import Dict, Tuple, Optional, List
 import dns.message
 import dns.query
 from aiohttp import web
-from .config import load_config
+from .config import load_config, DATA_DIR
 from .dns_proto import (
     DnsPacket,
     domain_to_bytes,
@@ -29,20 +29,17 @@ from .dns_proto import (
 
 CHUNK_PULL_SIZE = 380
 
-class EphemeralMemoryStore:
+class DiskMessageStore:
     """
-    100% In-Memory Ephemeral Store with 4-Hour TTL.
-    Messages and media are retained in RAM for 4 hours (14400s) and automatically pruned.
+    Disk-backed SQLite Store with 4-Hour Retention Window.
+    Messages and media are stored on disk in data/server_storage.db and automatically
+    pruned after retention_hours (default: 4 hours = 14400 seconds).
     """
-    def __init__(self, ttl_seconds: int = 14400, max_per_tag: int = 500):
+    def __init__(self, db_path: Path, ttl_seconds: int = 14400):
+        self.db_path = db_path
         self.ttl = ttl_seconds
-        self.max_per_tag = max_per_tag
-        # { target_tag: deque([(msg_id, timestamp, encrypted_bytes), ...], maxlen=500) }
-        self._buffers: Dict[str, deque] = {}
-        # { (target_tag, msg_id): (timestamp, raw_media_bytes) }
-        self._media: Dict[Tuple[str, int], Tuple[float, bytes]] = {}
-        self._next_id: Dict[str, int] = {}
         self.public_channels: set = set()
+        self._init_db()
         self.stats = {
             "start_time": time.time(),
             "total_queries": 0,
@@ -52,77 +49,135 @@ class EphemeralMemoryStore:
             "active_tags_count": 0
         }
 
+    def _init_db(self):
+        self.db_path.parent.mkdir(exist_ok=True)
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    target_tag TEXT NOT NULL,
+                    msg_id INTEGER NOT NULL,
+                    timestamp REAL NOT NULL,
+                    encrypted_data BLOB NOT NULL
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_tag_msg ON messages(target_tag, msg_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_msg_time ON messages(timestamp)")
+
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS media (
+                    target_tag TEXT NOT NULL,
+                    msg_id INTEGER NOT NULL,
+                    timestamp REAL NOT NULL,
+                    media_data BLOB NOT NULL,
+                    PRIMARY KEY (target_tag, msg_id)
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_media_time ON media(timestamp)")
+
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS public_channels (
+                    channel_name TEXT PRIMARY KEY,
+                    updated_at REAL NOT NULL
+                )
+            """)
+            cur = conn.cursor()
+            cur.execute("SELECT channel_name FROM public_channels")
+            for row in cur.fetchall():
+                self.public_channels.add(row[0])
+
     def _purge_expired(self):
-        now = time.time()
-        for tag, q in list(self._buffers.items()):
-            while q and (now - q[0][1] > self.ttl):
-                q.popleft()
-            if not q:
-                del self._buffers[tag]
+        cutoff = time.time() - self.ttl
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("DELETE FROM messages WHERE timestamp < ?", (cutoff,))
+            conn.execute("DELETE FROM media WHERE timestamp < ?", (cutoff,))
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(DISTINCT target_tag) FROM messages")
+            row = cur.fetchone()
+            self.stats["active_tags_count"] = row[0] if row else 0
 
-        stale_media = [k for k, v in self._media.items() if now - v[0] > self.ttl]
-        for k in stale_media:
-            del self._media[k]
-
-        self.stats["active_tags_count"] = len(self._buffers)
+    def register_public_channel(self, channel_name: str):
+        cname = channel_name.strip().lower()
+        self.public_channels.add(cname)
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO public_channels (channel_name, updated_at) VALUES (?, ?)",
+                (cname, time.time())
+            )
 
     def get_next_msg_id(self, target_tag: str) -> int:
-        cur = self._next_id.get(target_tag, 0) + 1
-        self._next_id[target_tag] = cur
-        return cur
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT MAX(msg_id) FROM messages WHERE target_tag = ?", (target_tag,))
+            row = cur.fetchone()
+            return (row[0] or 0) + 1
 
     def save_message(self, target_tag: str, msg_id: int, data: bytes):
         self._purge_expired()
-        if target_tag not in self._buffers:
-            self._buffers[target_tag] = deque(maxlen=self.max_per_tag)
-        self._buffers[target_tag].append((msg_id, time.time(), data))
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT INTO messages (target_tag, msg_id, timestamp, encrypted_data) VALUES (?, ?, ?, ?)",
+                (target_tag, msg_id, time.time(), data)
+            )
         self.stats["total_messages_received"] += 1
         self.stats["total_bytes_transferred"] += len(data)
-        self.stats["active_tags_count"] = len(self._buffers)
 
     def save_media(self, target_tag: str, msg_id: int, data: bytes):
         self._purge_expired()
-        self._media[(target_tag, msg_id)] = (time.time(), data)
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO media (target_tag, msg_id, timestamp, media_data) VALUES (?, ?, ?, ?)",
+                (target_tag, msg_id, time.time(), data)
+            )
         self.stats["total_bytes_transferred"] += len(data)
 
     def get_media(self, target_tag: str, msg_id: int) -> Optional[bytes]:
         self._purge_expired()
-        item = self._media.get((target_tag, msg_id))
-        return item[1] if item else None
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT media_data FROM media WHERE target_tag = ? AND msg_id = ?", (target_tag, msg_id))
+            row = cur.fetchone()
+            return row[0] if row else None
 
     def get_messages_after(self, target_tag: str, last_seen_id: int, limit: int = 1) -> List[Tuple[int, bytes]]:
         self._purge_expired()
-        if target_tag not in self._buffers:
-            return []
-        results = []
-        for msg_id, _, data in self._buffers[target_tag]:
-            if msg_id > last_seen_id:
-                results.append((msg_id, data))
-                if len(results) >= limit:
-                    break
-        return results
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT msg_id, encrypted_data FROM messages WHERE target_tag = ? AND msg_id > ? ORDER BY msg_id ASC LIMIT ?",
+                (target_tag, last_seen_id, limit)
+            )
+            return cur.fetchall()
 
     def get_message(self, target_tag: str, msg_id: int) -> Optional[bytes]:
         self._purge_expired()
-        if target_tag not in self._buffers:
-            return None
-        for m_id, _, data in self._buffers[target_tag]:
-            if m_id == msg_id:
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT encrypted_data FROM messages WHERE target_tag = ? AND msg_id = ?",
+                (target_tag, msg_id)
+            )
+            row = cur.fetchone()
+            if row:
                 self.stats["total_messages_delivered"] += 1
-                return data
-        return None
+                return row[0]
+            return None
 
-# Global in-memory store for server runtime
-GLOBAL_MEMORY_STORE = EphemeralMemoryStore()
+# Global disk store for server runtime
+GLOBAL_DISK_STORE = DiskMessageStore(
+    DATA_DIR / "server_storage.db",
+    ttl_seconds=int(load_config().get("retention_hours", 4)) * 3600
+)
 
 class DnsTunnelServerProtocol(asyncio.DatagramProtocol):
-    def __init__(self, config: dict, store: Optional[EphemeralMemoryStore] = None):
+    def __init__(self, config: dict, store: Optional[DiskMessageStore] = None):
         self.config = config
         self.base_domain = config.get("base_domain", "msg.example.com").lower()
         self.max_file_size = config.get("max_file_size_mb", 20) * 1024 * 1024
         self.forward_upstream = config.get("forward_dns_upstream", "")
         self.transport = None
-        self.store = store or GLOBAL_MEMORY_STORE
+        self.store = store or GLOBAL_DISK_STORE
         self.incoming_assembly: Dict[Tuple[str, int], dict] = {}
 
     def connection_made(self, transport):
@@ -312,7 +367,7 @@ async def run_server():
 
     # 1. Start DNS Tunnel UDP Server
     transport, protocol = await loop.create_datagram_endpoint(
-        lambda: DnsTunnelServerProtocol(cfg, GLOBAL_MEMORY_STORE),
+        lambda: DnsTunnelServerProtocol(cfg, GLOBAL_DISK_STORE),
         local_addr=(host, port)
     )
 
@@ -332,7 +387,7 @@ async def run_server():
     print(f"DNS Messenger Server active on UDP {host}:{port}")
     print(f"Server Web Admin Panel: http://{admin_host}:{admin_port}")
     print(f"Base Domain: {cfg.get('base_domain')}")
-    print(f"Memory Architecture: 100% In-Memory RAM Ring Buffer (Zero Disk Writes)")
+    print(f"Storage Architecture: Disk-backed SQLite (data/server_storage.db with 4-Hour Retention)")
     print("=======================================================\n")
 
     try:

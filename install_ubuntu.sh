@@ -82,12 +82,14 @@ if [[ -z "${FORWARD_UPSTREAM:-}" ]]; then
 fi
 
 MAX_FILE_MB="${MAX_FILE_MB:-20}"
+RETENTION_HOURS="${RETENTION_HOURS:-4}"
 
 echo -e "\n${CYAN}Summary Configuration:${NC}"
 echo -e "  - Base Domain       : ${GREEN}${BASE_DOMAIN}${NC}"
 echo -e "  - Server Port       : ${GREEN}${LISTEN_PORT}${NC}"
 echo -e "  - Forward Upstream  : ${GREEN}${FORWARD_UPSTREAM:-None}${NC}"
 echo -e "  - Max File Size     : ${GREEN}${MAX_FILE_MB} MB${NC}"
+echo -e "  - Disk Retention    : ${GREEN}${RETENTION_HOURS} Hours${NC}"
 echo -e "  - Install Path      : ${GREEN}${INSTALL_DIR}${NC}\n"
 
 # 5. Handle systemd-resolved conflict if user selected port 53 and resolved is running
@@ -147,6 +149,7 @@ cat > "$INSTALL_DIR/data/config.json" << EOF
   "server_listen_host": "0.0.0.0",
   "server_listen_port": ${LISTEN_PORT},
   "forward_dns_upstream": "${FORWARD_UPSTREAM}",
+  "retention_hours": ${RETENTION_HOURS},
   "max_file_size_mb": ${MAX_FILE_MB},
   "chunk_size_bytes": 110,
   "web_host": "127.0.0.1",

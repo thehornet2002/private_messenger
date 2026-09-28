@@ -1,11 +1,12 @@
 import asyncio
 import os
-from dns_messenger.server import DnsTunnelServerProtocol, GLOBAL_MEMORY_STORE
+import sqlite3
+from dns_messenger.server import DnsTunnelServerProtocol, GLOBAL_DISK_STORE
 from dns_messenger.client import DnsTunnelClient
 from dns_messenger.crypto import get_message_file_bytes, get_target_tag, pack_message, encrypt_payload
 
 async def run_full_suite():
-    print("[1/6] Starting In-Memory Ephemeral DNS Server on 127.0.0.1:5399...")
+    print("[1/6] Starting Disk-backed DNS Server (4-Hour Retention) on 127.0.0.1:5399...")
     cfg = {
         "base_domain": "tunnel.msg.local",
         "server_listen_host": "127.0.0.1",
@@ -14,7 +15,7 @@ async def run_full_suite():
     }
     loop = asyncio.get_running_loop()
     transport, protocol = await loop.create_datagram_endpoint(
-        lambda: DnsTunnelServerProtocol(cfg, GLOBAL_MEMORY_STORE),
+        lambda: DnsTunnelServerProtocol(cfg, GLOBAL_DISK_STORE),
         local_addr=("127.0.0.1", 5399)
     )
 
@@ -32,8 +33,8 @@ async def run_full_suite():
     pub_tag = get_target_tag(chan_pub, prefix="chan")
     pub_packed = pack_message(sender="📢 Telegram [@breaking]", text="Public News Alert!", is_public=True)
     pub_enc = encrypt_payload(pub_packed, password=None)
-    new_id = GLOBAL_MEMORY_STORE.get_next_msg_id(pub_tag)
-    GLOBAL_MEMORY_STORE.save_message(pub_tag, new_id, pub_enc)
+    new_id = GLOBAL_DISK_STORE.get_next_msg_id(pub_tag)
+    GLOBAL_DISK_STORE.save_message(pub_tag, new_id, pub_enc)
 
     # Client joins public channel with NO password
     client2 = DnsTunnelClient()
@@ -55,12 +56,12 @@ async def run_full_suite():
     ok, err = await client1.send_message("channel", chan_priv, text="Confidential Group Message")
     assert ok, f"Send failed: {err}"
 
-    # Verify server holds ZERO plaintext in RAM
+    # Verify server holds ZERO plaintext on disk
     sec_tag = get_target_tag(chan_priv, prefix="chan")
-    server_blob = GLOBAL_MEMORY_STORE.get_message(sec_tag, 1)
+    server_blob = GLOBAL_DISK_STORE.get_message(sec_tag, 1)
     assert server_blob is not None
-    assert b"Confidential Group Message" not in server_blob, "Plaintext leaked in server RAM!"
-    print(f"  -> Server RAM payload: {server_blob[:12].hex()}... (Plaintext nowhere found)")
+    assert b"Confidential Group Message" not in server_blob, "Plaintext leaked in server storage!"
+    print(f"  -> Server disk ciphertext: {server_blob[:12].hex()}... (Plaintext nowhere found)")
 
     # Client2 joins with correct password
     client2.join_channel(chan_priv, secret_pass)
@@ -96,41 +97,41 @@ async def run_full_suite():
     assert recovered_bytes == test_file_bytes, "File byte mismatch!"
     print(f"  -> File '{file_msg['file_name']}' received and verified successfully!")
 
-    print("[6/7] Checking In-Memory Stats & Zero Disk Writes...")
-    stats = GLOBAL_MEMORY_STORE.stats
-    print(f"  -> Total queries handled: {stats['total_queries']}")
-    print(f"  -> Messages received in RAM: {stats['total_messages_received']}")
-    print(f"  -> Bytes transferred: {stats['total_bytes_transferred']}")
-    assert stats["total_queries"] > 5
-    assert not os.path.exists("data/server_messages.db"), "Server must NOT create any sqlite database file!"
-    print("  -> Zero-Knowledge In-Memory Architecture Verified!")
+    print("[6/7] Checking Disk Persistence (SQLite WAL & Auto-Prune)...")
+    assert GLOBAL_DISK_STORE.db_path.exists(), "server_storage.db must exist on disk!"
+    with sqlite3.connect(GLOBAL_DISK_STORE.db_path) as conn:
+        row_cnt = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+        assert row_cnt > 0, "Messages must be persisted on disk!"
+        print(f"  -> Total messages persisted on disk in SQLite: {row_cnt}")
+    print("  -> Disk Persistence & Storage Architecture Verified!")
 
     print("[7/7] Testing Channel Auto-Discovery & On-Demand Media Pull (Autodownload OFF)...")
-    GLOBAL_MEMORY_STORE.public_channels.add("world_news")
+    chan_auto = f"autonews_{os.getpid()}"
+    GLOBAL_DISK_STORE.register_public_channel(chan_auto)
     discovered = await client1.discover_public_channels()
-    assert "world_news" in discovered
+    assert chan_auto in discovered
     print(f"  -> Client auto-discovered channels: {discovered}")
 
     # Test on-demand media
-    m_tag = get_target_tag("world_news", prefix="chan")
-    m_id = GLOBAL_MEMORY_STORE.get_next_msg_id(m_tag)
+    m_tag = get_target_tag(chan_auto, prefix="chan")
+    m_id = GLOBAL_DISK_STORE.get_next_msg_id(m_tag)
     sample_photo = b"JPEG_IMAGE_BYTES_DEMO_" * 40
-    GLOBAL_MEMORY_STORE.save_media(m_tag, m_id, sample_photo)
+    GLOBAL_DISK_STORE.save_media(m_tag, m_id, sample_photo)
 
     # Save message with has_media=True, file_bytes=b""
     p_packed = pack_message(sender="Telegram", text="Breaking Photo", file_name="photo.jpg", is_public=True, has_media=True, media_type="photo", media_size=len(sample_photo))
     p_enc = encrypt_payload(p_packed, password=None)
-    GLOBAL_MEMORY_STORE.save_message(m_tag, m_id, p_enc)
+    GLOBAL_DISK_STORE.save_message(m_tag, m_id, p_enc)
 
     # Client polls: only text arrives!
-    await client1.poll_target("channel", "world_news")
-    msg_obj = client1.state["channels"]["world_news"]["messages"][-1]
+    await client1.poll_target("channel", chan_auto)
+    msg_obj = client1.state["channels"][chan_auto]["messages"][-1]
     assert msg_obj["has_media"] is True
     assert msg_obj.get("file_data") == "", "Media should NOT be auto-downloaded!"
     print("  -> Text arrived without media (Autodownload OFF confirmed).")
 
     # Client on-demand downloads media:
-    dl_media = await client1.fetch_media_for_message("channel", "world_news", m_id)
+    dl_media = await client1.fetch_media_for_message("channel", chan_auto, m_id)
     assert dl_media == sample_photo, "On-demand media download mismatch!"
     print("  -> On-demand media pull over DNS verified successfully!")
 

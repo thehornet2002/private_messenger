@@ -8,7 +8,7 @@ from pyrogram.types import Message
 
 from .config import load_config, save_config, DATA_DIR
 from .crypto import get_target_tag, pack_message, encrypt_payload
-from .server import GLOBAL_MEMORY_STORE
+from .server import GLOBAL_DISK_STORE
 
 logger = logging.getLogger("TelegramServerBot")
 
@@ -62,7 +62,7 @@ class TelegramServerBot:
         # Register public broadcast channels for client auto-discovery
         for item in channels_map:
             if not item.get("password"):
-                GLOBAL_MEMORY_STORE.public_channels.add(item.get("messenger_channel", "general").strip().lower())
+                GLOBAL_DISK_STORE.register_public_channel(item.get("messenger_channel", "general").strip().lower())
 
         @self.client.on_message(~filters.me)
         async def on_post(bot: Client, message: Message):
@@ -106,14 +106,14 @@ class TelegramServerBot:
 
                     is_public = (m_pass is None)
                     if is_public:
-                        GLOBAL_MEMORY_STORE.public_channels.add(m_chan)
+                        GLOBAL_DISK_STORE.register_public_channel(m_chan)
 
                     tag = get_target_tag(m_chan, prefix="chan")
-                    new_id = GLOBAL_MEMORY_STORE.get_next_msg_id(tag)
+                    new_id = GLOBAL_DISK_STORE.get_next_msg_id(tag)
 
-                    # Store media separately in RAM for on-demand pull
+                    # Store media in disk storage with 4-hour retention
                     if file_bytes:
-                        GLOBAL_MEMORY_STORE.save_media(tag, new_id, file_bytes)
+                        GLOBAL_DISK_STORE.save_media(tag, new_id, file_bytes)
 
                     # Message payload contains metadata without heavy bytes
                     packed = pack_message(
@@ -128,8 +128,8 @@ class TelegramServerBot:
                     )
                     encrypted_data = encrypt_payload(packed, password=m_pass)
 
-                    # Inject directly into server's In-Memory RAM buffer
-                    GLOBAL_MEMORY_STORE.save_message(tag, new_id, encrypted_data)
+                    # Save to server disk storage (4-hour retention)
+                    GLOBAL_DISK_STORE.save_message(tag, new_id, encrypted_data)
                     logger.info(f"Telegram Server Bot: Forwarded post from {target_tg} to '{m_chan}' (Media: {media_type}, Size: {len(file_bytes)}B, Public: {is_public})")
                     logger.info(f"Telegram Server Bot: Forwarded post from {target_tg} to '{m_chan}' (Public: {is_public})")
 

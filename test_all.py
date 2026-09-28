@@ -28,8 +28,8 @@ async def run_full_suite():
     print("  -> Ping OK!")
 
     print("[3/6] Testing Public / Telegram Broadcast (No password)...")
-    # Simulate server injecting a Telegram post into ephemeral RAM
-    pub_tag = get_target_tag("news", prefix="chan")
+    chan_pub = f"news_{os.getpid()}"
+    pub_tag = get_target_tag(chan_pub, prefix="chan")
     pub_packed = pack_message(sender="📢 Telegram [@breaking]", text="Public News Alert!", is_public=True)
     pub_enc = encrypt_payload(pub_packed, password=None)
     new_id = GLOBAL_MEMORY_STORE.get_next_msg_id(pub_tag)
@@ -39,41 +39,42 @@ async def run_full_suite():
     client2 = DnsTunnelClient()
     client2.resolvers = ["127.0.0.1:5399"]
     client2.base_domain = "tunnel.msg.local"
-    client2.join_channel("news", password="")  # Public
+    client2.join_channel(chan_pub, password="")  # Public
 
-    fetched = await client2.poll_target("channel", "news")
+    fetched = await client2.poll_target("channel", chan_pub)
     assert fetched == 1, f"Expected 1 fetched public message, got {fetched}"
-    pub_msg = client2.state["channels"]["news"]["messages"][-1]
+    pub_msg = client2.state["channels"][chan_pub]["messages"][-1]
     assert pub_msg["is_public"] is True
     assert "Public News Alert!" in pub_msg["text"]
     print(f"  -> Client received public broadcast: '{pub_msg['text']}'")
 
     print("[4/6] Testing Private Encrypted Group Chat (AES-256-GCM)...")
+    chan_priv = f"secret_{os.getpid()}"
     secret_pass = "UltraSecretGroupPassword123"
-    client1.join_channel("secret_room", secret_pass)
-    ok, err = await client1.send_message("channel", "secret_room", text="Confidential Group Message")
+    client1.join_channel(chan_priv, secret_pass)
+    ok, err = await client1.send_message("channel", chan_priv, text="Confidential Group Message")
     assert ok, f"Send failed: {err}"
 
     # Verify server holds ZERO plaintext in RAM
-    sec_tag = get_target_tag("secret_room", prefix="chan")
+    sec_tag = get_target_tag(chan_priv, prefix="chan")
     server_blob = GLOBAL_MEMORY_STORE.get_message(sec_tag, 1)
     assert server_blob is not None
     assert b"Confidential Group Message" not in server_blob, "Plaintext leaked in server RAM!"
     print(f"  -> Server RAM payload: {server_blob[:12].hex()}... (Plaintext nowhere found)")
 
     # Client2 joins with correct password
-    client2.join_channel("secret_room", secret_pass)
-    fetched_sec = await client2.poll_target("channel", "secret_room")
+    client2.join_channel(chan_priv, secret_pass)
+    fetched_sec = await client2.poll_target("channel", chan_priv)
     assert fetched_sec == 1, "Failed to fetch private message"
-    assert client2.state["channels"]["secret_room"]["messages"][-1]["text"] == "Confidential Group Message"
+    assert client2.state["channels"][chan_priv]["messages"][-1]["text"] == "Confidential Group Message"
     print("  -> Client2 decrypted group message successfully!")
 
     # Client3 joins with WRONG password -> cannot read
     client3 = DnsTunnelClient()
     client3.resolvers = ["127.0.0.1:5399"]
     client3.base_domain = "tunnel.msg.local"
-    client3.join_channel("secret_room", "WrongPassword")
-    fetched_wrong = await client3.poll_target("channel", "secret_room")
+    client3.join_channel(chan_priv, "WrongPassword")
+    fetched_wrong = await client3.poll_target("channel", chan_priv)
     assert fetched_wrong == 0, "Wrong password must not decrypt message"
     print("  -> Wrong password client rejected correctly!")
 
@@ -81,16 +82,16 @@ async def run_full_suite():
     test_file_bytes = b"BINARY_DATA_TEST_FILE_CONTENT_" * 60
     ok, msg = await client1.send_message(
         chat_type="channel",
-        target_name="secret_room",
+        target_name=chan_priv,
         text="Sending attachment",
         file_name="secret_doc.bin",
         file_bytes=test_file_bytes
     )
     assert ok, f"File send failed: {msg}"
 
-    fetched_file = await client2.poll_target("channel", "secret_room")
+    fetched_file = await client2.poll_target("channel", chan_priv)
     assert fetched_file == 1, "File message pull failed"
-    file_msg = client2.state["channels"]["secret_room"]["messages"][-1]
+    file_msg = client2.state["channels"][chan_priv]["messages"][-1]
     recovered_bytes = get_message_file_bytes(file_msg)
     assert recovered_bytes == test_file_bytes, "File byte mismatch!"
     print(f"  -> File '{file_msg['file_name']}' received and verified successfully!")

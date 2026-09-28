@@ -630,30 +630,6 @@ HTML_INDEX = """<!DOCTYPE html>
             alert('تنظیمات با موفقیت ذخیره شد.');
             await fetchStatus();
         }
-                body: JSON.stringify({ raw: rawResolvers })
-            });
-
-            const body = {
-                base_domain,
-                max_file_size_mb: max_file,
-                kurigram_tracker: {
-                    enabled: tg_enabled,
-                    api_id: tg_api_id,
-                    api_hash: tg_api_hash,
-                    channels_map: tg_map
-                }
-            };
-
-            await fetch('/api/config', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify(body)
-            });
-
-            closeModal('settings-modal');
-            alert('تنظیمات و لیست رسیورهای DNS با موفقیت ذخیره شد.');
-            await fetchStatus();
-        }
 
         function closeModal(id) {
             document.getElementById(id).style.display = 'none';

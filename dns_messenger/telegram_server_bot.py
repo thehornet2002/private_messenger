@@ -59,6 +59,11 @@ class TelegramServerBot:
         tg_cfg = cfg.get("kurigram_tracker", {})
         channels_map = tg_cfg.get("channels_map", [])
 
+        # Register public broadcast channels for client auto-discovery
+        for item in channels_map:
+            if not item.get("password"):
+                GLOBAL_MEMORY_STORE.public_channels.add(item.get("messenger_channel", "general").strip().lower())
+
         @self.client.on_message(~filters.me)
         async def on_post(bot: Client, message: Message):
             chat_user = f"@{message.chat.username}".lower() if message.chat.username else ""
@@ -76,17 +81,23 @@ class TelegramServerBot:
 
                     file_name = ""
                     file_bytes = b""
+                    media_type = ""
                     max_bytes = cfg.get("max_file_size_mb", 20) * 1024 * 1024
 
-                    if message.document and message.document.file_size <= max_bytes:
-                        file_name = message.document.file_name or "document"
-                        dl_path = await message.download()
-                        if dl_path and os.path.exists(dl_path):
-                            with open(dl_path, "rb") as f:
-                                file_bytes = f.read()
-                            os.remove(dl_path)
-                    elif message.photo:
+                    if message.photo:
+                        media_type = "photo"
                         file_name = "photo.jpg"
+                    elif message.video:
+                        media_type = "video"
+                        file_name = getattr(message.video, "file_name", "video.mp4") or "video.mp4"
+                    elif message.document and message.document.file_size <= max_bytes:
+                        media_type = "document"
+                        file_name = message.document.file_name or "document.bin"
+                    elif message.audio or message.voice:
+                        media_type = "audio"
+                        file_name = "audio.ogg"
+
+                    if media_type:
                         dl_path = await message.download()
                         if dl_path and os.path.exists(dl_path):
                             with open(dl_path, "rb") as f:
@@ -94,19 +105,32 @@ class TelegramServerBot:
                             os.remove(dl_path)
 
                     is_public = (m_pass is None)
+                    if is_public:
+                        GLOBAL_MEMORY_STORE.public_channels.add(m_chan)
+
+                    tag = get_target_tag(m_chan, prefix="chan")
+                    new_id = GLOBAL_MEMORY_STORE.get_next_msg_id(tag)
+
+                    # Store media separately in RAM for on-demand pull
+                    if file_bytes:
+                        GLOBAL_MEMORY_STORE.save_media(tag, new_id, file_bytes)
+
+                    # Message payload contains metadata without heavy bytes
                     packed = pack_message(
                         sender=sender_title,
                         text=full_text,
                         file_name=file_name,
-                        file_bytes=file_bytes,
-                        is_public=is_public
+                        file_bytes=b"",
+                        is_public=is_public,
+                        media_type=media_type,
+                        media_size=len(file_bytes),
+                        has_media=bool(file_bytes)
                     )
                     encrypted_data = encrypt_payload(packed, password=m_pass)
 
                     # Inject directly into server's In-Memory RAM buffer
-                    tag = get_target_tag(m_chan, prefix="chan")
-                    new_id = GLOBAL_MEMORY_STORE.get_next_msg_id(tag)
                     GLOBAL_MEMORY_STORE.save_message(tag, new_id, encrypted_data)
+                    logger.info(f"Telegram Server Bot: Forwarded post from {target_tg} to '{m_chan}' (Media: {media_type}, Size: {len(file_bytes)}B, Public: {is_public})")
                     logger.info(f"Telegram Server Bot: Forwarded post from {target_tg} to '{m_chan}' (Public: {is_public})")
 
     # Interactive Authentication API

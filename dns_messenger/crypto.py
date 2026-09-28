@@ -82,15 +82,28 @@ def decrypt_payload(encrypted_blob: bytes, password: Optional[str] = None) -> Op
 
     return None
 
-def pack_message(sender: str, text: str = "", file_name: str = "", file_bytes: bytes = b"", is_public: bool = False) -> bytes:
-    """Serialize chat message / file into JSON bytes before transmission."""
+def pack_message(
+    sender: str,
+    text: str = "",
+    file_name: str = "",
+    file_bytes: bytes = b"",
+    is_public: bool = False,
+    media_type: str = "",
+    media_size: int = 0,
+    has_media: bool = False
+) -> bytes:
+    """Serialize chat message into JSON bytes."""
+    final_has_media = has_media or bool(media_size > 0) or bool(file_bytes) or bool(file_name)
+    final_media_size = media_size if media_size > 0 else len(file_bytes)
     obj = {
         "sender": sender,
         "text": text,
         "is_public": is_public,
-        "has_file": bool(file_bytes),
+        "has_file": final_has_media,
+        "has_media": final_has_media,
+        "media_type": media_type or ("document" if file_name else ""),
         "file_name": file_name,
-        "file_size": len(file_bytes),
+        "file_size": final_media_size,
         "file_data": file_bytes.hex() if file_bytes else ""
     }
     return json.dumps(obj, ensure_ascii=False).encode("utf-8")

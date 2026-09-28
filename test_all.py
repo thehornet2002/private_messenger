@@ -96,7 +96,7 @@ async def run_full_suite():
     assert recovered_bytes == test_file_bytes, "File byte mismatch!"
     print(f"  -> File '{file_msg['file_name']}' received and verified successfully!")
 
-    print("[6/6] Checking In-Memory Stats & Zero Disk Writes...")
+    print("[6/7] Checking In-Memory Stats & Zero Disk Writes...")
     stats = GLOBAL_MEMORY_STORE.stats
     print(f"  -> Total queries handled: {stats['total_queries']}")
     print(f"  -> Messages received in RAM: {stats['total_messages_received']}")
@@ -104,6 +104,35 @@ async def run_full_suite():
     assert stats["total_queries"] > 5
     assert not os.path.exists("data/server_messages.db"), "Server must NOT create any sqlite database file!"
     print("  -> Zero-Knowledge In-Memory Architecture Verified!")
+
+    print("[7/7] Testing Channel Auto-Discovery & On-Demand Media Pull (Autodownload OFF)...")
+    GLOBAL_MEMORY_STORE.public_channels.add("world_news")
+    discovered = await client1.discover_public_channels()
+    assert "world_news" in discovered
+    print(f"  -> Client auto-discovered channels: {discovered}")
+
+    # Test on-demand media
+    m_tag = get_target_tag("world_news", prefix="chan")
+    m_id = GLOBAL_MEMORY_STORE.get_next_msg_id(m_tag)
+    sample_photo = b"JPEG_IMAGE_BYTES_DEMO_" * 40
+    GLOBAL_MEMORY_STORE.save_media(m_tag, m_id, sample_photo)
+
+    # Save message with has_media=True, file_bytes=b""
+    p_packed = pack_message(sender="Telegram", text="Breaking Photo", file_name="photo.jpg", is_public=True, has_media=True, media_type="photo", media_size=len(sample_photo))
+    p_enc = encrypt_payload(p_packed, password=None)
+    GLOBAL_MEMORY_STORE.save_message(m_tag, m_id, p_enc)
+
+    # Client polls: only text arrives!
+    await client1.poll_target("channel", "world_news")
+    msg_obj = client1.state["channels"]["world_news"]["messages"][-1]
+    assert msg_obj["has_media"] is True
+    assert msg_obj.get("file_data") == "", "Media should NOT be auto-downloaded!"
+    print("  -> Text arrived without media (Autodownload OFF confirmed).")
+
+    # Client on-demand downloads media:
+    dl_media = await client1.fetch_media_for_message("channel", "world_news", m_id)
+    assert dl_media == sample_photo, "On-demand media download mismatch!"
+    print("  -> On-demand media pull over DNS verified successfully!")
 
     transport.close()
     print("\n=======================================================")

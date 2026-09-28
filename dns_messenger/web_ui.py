@@ -326,8 +326,20 @@ HTML_INDEX = """<!DOCTYPE html>
         async function init() {
             await fetchStatus();
             await fetchChats();
+            await discoverChannels();
             setInterval(fetchStatus, 4000);
             setInterval(pollMessages, 6000);
+            setInterval(discoverChannels, 15000);
+        }
+
+        async function discoverChannels() {
+            try {
+                const res = await fetch('/api/channels/discover', { method: 'POST' });
+                const data = await res.json();
+                if (data.channels && data.channels.length > 0) {
+                    await fetchChats();
+                }
+            } catch(e) {}
         }
 
         async function fetchStatus() {
@@ -422,26 +434,70 @@ HTML_INDEX = """<!DOCTYPE html>
             messages.forEach(msg => {
                 const bubble = document.createElement('div');
                 bubble.className = 'msg-bubble ' + (msg.sender === 'User' ? 'self' : 'peer');
-                let fileHtml = '';
-                if (msg.has_file && msg.file_name) {
-                    const sizeStr = (msg.file_size / 1024).toFixed(1) + ' KB';
-                    fileHtml = `
-                        <div class="msg-file">
-                            <span>📄 ${msg.file_name} (${sizeStr})</span>
-                            <a href="/api/file/${currentTab}/${encodeURIComponent(currentChat)}/${msg.msg_id}" download="${msg.file_name}" class="btn-primary" style="text-decoration:none; font-size:0.75rem; padding:4px 8px;">دانلود</a>
-                        </div>
-                    `;
+                let mediaHtml = '';
+                if (msg.has_media || msg.has_file) {
+                    const sizeStr = msg.file_size ? (msg.file_size / 1024).toFixed(1) + ' KB' : '';
+                    const isDownloaded = Boolean(msg.file_data);
+                    const mType = msg.media_type || (msg.file_name && msg.file_name.endsWith('.jpg') ? 'photo' : 'document');
+
+                    if (isDownloaded && mType === 'photo') {
+                        mediaHtml = `
+                            <div style="margin-top:8px;">
+                                <img src="/api/file/${currentTab}/${encodeURIComponent(currentChat)}/${msg.msg_id}" style="max-width:100%; max-height:360px; border-radius:8px; cursor:pointer;" onclick="window.open(this.src)">
+                            </div>
+                        `;
+                    } else if (isDownloaded && mType === 'video') {
+                        mediaHtml = `
+                            <div style="margin-top:8px;">
+                                <video controls style="max-width:100%; max-height:360px; border-radius:8px;" src="/api/file/${currentTab}/${encodeURIComponent(currentChat)}/${msg.msg_id}"></video>
+                            </div>
+                        `;
+                    } else if (isDownloaded) {
+                        mediaHtml = `
+                            <div class="msg-file">
+                                <span>📄 ${escapeHtml(msg.file_name || 'فایل')} (${sizeStr})</span>
+                                <a href="/api/file/${currentTab}/${encodeURIComponent(currentChat)}/${msg.msg_id}" download="${escapeHtml(msg.file_name || 'file')}" class="btn-primary" style="text-decoration:none; font-size:0.75rem; padding:4px 8px;">ذخیره فایل</a>
+                            </div>
+                        `;
+                    } else {
+                        const icon = mType === 'photo' ? '📷' : (mType === 'video' ? '🎥' : '📄');
+                        const label = mType === 'photo' ? 'عکس' : (mType === 'video' ? 'ویدیو' : 'فایل');
+                        mediaHtml = `
+                            <div class="msg-file" id="media-box-${msg.msg_id}">
+                                <span>${icon} ${label} ${escapeHtml(msg.file_name || '')} (${sizeStr})</span>
+                                <button type="button" class="btn-primary" style="font-size:0.75rem; padding:4px 10px;" onclick="downloadMediaClick('${currentTab}', '${encodeURIComponent(currentChat)}', ${msg.msg_id})">📥 دانلود و نمایش</button>
+                            </div>
+                        `;
+                    }
                 }
                 const timeStr = msg.timestamp ? new Date(msg.timestamp * 1000).toLocaleTimeString('fa-IR', {hour:'2-digit', minute:'2-digit'}) : '';
                 bubble.innerHTML = `
                     <div class="msg-sender">${msg.sender || 'ناشناس'}</div>
                     <div class="msg-text">${escapeHtml(msg.text || '')}</div>
-                    ${fileHtml}
+                    ${mediaHtml}
                     <div class="msg-time">${timeStr}</div>
                 `;
                 box.appendChild(bubble);
             });
             box.scrollTop = box.scrollHeight;
+        }
+
+        async function downloadMediaClick(chatType, target, msgId) {
+            const box = document.getElementById('media-box-' + msgId);
+            if (box) {
+                box.innerHTML = '<span>⏳ در حال دریافت قطعات مدیا از تونل DNS...</span>';
+            }
+            try {
+                const res = await fetch(`/api/media/download/${chatType}/${target}/${msgId}`, { method: 'POST' });
+                if (!res.ok) {
+                    alert('خطا در دانلود مدیا از DNS');
+                    if (box) box.innerHTML = '<span style="color:var(--danger);">خطا در دریافت</span>';
+                    return;
+                }
+                await loadMessages();
+            } catch(e) {
+                alert('خطا: ' + e);
+            }
         }
 
         function escapeHtml(text) {
@@ -663,6 +719,8 @@ class WebApp:
         self.app.router.add_get("/api/resolvers", self.get_resolvers_handler)
         self.app.router.add_post("/api/resolvers", self.save_resolvers_handler)
         self.app.router.add_post("/api/resolvers/benchmark", self.benchmark_resolvers_handler)
+        self.app.router.add_post("/api/channels/discover", self.discover_channels_handler)
+        self.app.router.add_post("/api/media/download/{chat_type}/{target_name}/{msg_id}", self.media_download_handler)
 
     async def index_handler(self, request):
         return web.Response(text=HTML_INDEX, content_type="text/html")
@@ -747,6 +805,19 @@ class WebApp:
         await self.client.poll_all(target_priority=target)
         return web.json_response({"ok": True})
 
+    async def discover_channels_handler(self, request):
+        chans = await self.client.discover_public_channels()
+        return web.json_response({"ok": True, "channels": chans})
+
+    async def media_download_handler(self, request):
+        chat_type = request.match_info["chat_type"]
+        target = request.match_info["target_name"].strip().lower()
+        msg_id = int(request.match_info["msg_id"])
+        media_bytes = await self.client.fetch_media_for_message(chat_type, target, msg_id)
+        if not media_bytes:
+            return web.Response(status=404, text="Media not found or download failed")
+        return web.json_response({"ok": True})
+
     async def file_download_handler(self, request):
         chat_type = request.match_info["chat_type"]
         target = request.match_info["target_name"].strip().lower()
@@ -756,6 +827,8 @@ class WebApp:
         for msg in chat_info.get("messages", []):
             if msg.get("msg_id") == msg_id:
                 raw_bytes = get_message_file_bytes(msg)
+                if not raw_bytes:
+                    raw_bytes = await self.client.fetch_media_for_message(chat_type, target, msg_id)
                 if raw_bytes:
                     headers = {
                         "Content-Disposition": f'attachment; filename="{msg.get("file_name", "download.bin")}"'

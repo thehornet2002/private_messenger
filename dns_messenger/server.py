@@ -21,22 +21,28 @@ from .dns_proto import (
     PKT_CHUNK_RESP,
     PKT_PING,
     PKT_PONG,
+    PKT_DISCOVER_CHANNELS,
+    PKT_CHANNELS_RESP,
+    PKT_PULL_MEDIA,
+    PKT_MEDIA_RESP,
 )
 
 CHUNK_PULL_SIZE = 380
 
 class EphemeralMemoryStore:
     """
-    100% In-Memory Ephemeral Store.
-    Zero data is written to disk. Messages are stored only in RAM
-    as a temporary ring buffer and automatically expire after TTL.
+    100% In-Memory Ephemeral Store with 4-Hour TTL.
+    Messages and media are retained in RAM for 4 hours (14400s) and automatically pruned.
     """
-    def __init__(self, ttl_seconds: int = 7200, max_per_tag: int = 100):
+    def __init__(self, ttl_seconds: int = 14400, max_per_tag: int = 500):
         self.ttl = ttl_seconds
         self.max_per_tag = max_per_tag
-        # { target_tag: deque([(msg_id, timestamp, encrypted_bytes), ...], maxlen=100) }
+        # { target_tag: deque([(msg_id, timestamp, encrypted_bytes), ...], maxlen=500) }
         self._buffers: Dict[str, deque] = {}
+        # { (target_tag, msg_id): (timestamp, raw_media_bytes) }
+        self._media: Dict[Tuple[str, int], Tuple[float, bytes]] = {}
         self._next_id: Dict[str, int] = {}
+        self.public_channels: set = set()
         self.stats = {
             "start_time": time.time(),
             "total_queries": 0,
@@ -53,6 +59,11 @@ class EphemeralMemoryStore:
                 q.popleft()
             if not q:
                 del self._buffers[tag]
+
+        stale_media = [k for k, v in self._media.items() if now - v[0] > self.ttl]
+        for k in stale_media:
+            del self._media[k]
+
         self.stats["active_tags_count"] = len(self._buffers)
 
     def get_next_msg_id(self, target_tag: str) -> int:
@@ -68,6 +79,16 @@ class EphemeralMemoryStore:
         self.stats["total_messages_received"] += 1
         self.stats["total_bytes_transferred"] += len(data)
         self.stats["active_tags_count"] = len(self._buffers)
+
+    def save_media(self, target_tag: str, msg_id: int, data: bytes):
+        self._purge_expired()
+        self._media[(target_tag, msg_id)] = (time.time(), data)
+        self.stats["total_bytes_transferred"] += len(data)
+
+    def get_media(self, target_tag: str, msg_id: int) -> Optional[bytes]:
+        self._purge_expired()
+        item = self._media.get((target_tag, msg_id))
+        return item[1] if item else None
 
     def get_messages_after(self, target_tag: str, last_seen_id: int, limit: int = 1) -> List[Tuple[int, bytes]]:
         self._purge_expired()
@@ -221,6 +242,32 @@ class DnsTunnelServerProtocol(asyncio.DatagramProtocol):
             chunk_data = enc_data[start:start + CHUNK_PULL_SIZE]
             return DnsPacket(
                 PKT_CHUNK_RESP,
+                session_id=pkt.session_id,
+                target_tag=pkt.target_tag,
+                msg_id=pkt.msg_id,
+                chunk_idx=pkt.chunk_idx,
+                total_chunks=total_chunks,
+                payload=chunk_data
+            )
+
+        elif pkt.pkt_type == PKT_DISCOVER_CHANNELS:
+            import json
+            chans = list(self.store.public_channels)
+            return DnsPacket(
+                PKT_CHANNELS_RESP,
+                session_id=pkt.session_id,
+                payload=json.dumps(chans).encode("utf-8")
+            )
+
+        elif pkt.pkt_type == PKT_PULL_MEDIA:
+            media_data = self.store.get_media(pkt.target_tag, pkt.msg_id)
+            if not media_data:
+                return None
+            total_chunks = max(1, math.ceil(len(media_data) / CHUNK_PULL_SIZE))
+            start = pkt.chunk_idx * CHUNK_PULL_SIZE
+            chunk_data = media_data[start:start + CHUNK_PULL_SIZE]
+            return DnsPacket(
+                PKT_MEDIA_RESP,
                 session_id=pkt.session_id,
                 target_tag=pkt.target_tag,
                 msg_id=pkt.msg_id,

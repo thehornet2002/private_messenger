@@ -9,14 +9,18 @@ import dns.rrset
 MAGIC = 0xD5
 
 # Packet Types
-PKT_PUSH_CHUNK = 1   # Client sending encrypted chunk
-PKT_PUSH_ACK   = 2   # Server ACK chunk
-PKT_POLL_META  = 3   # Client asking for message info for a target tag
-PKT_META_RESP  = 4   # Server returning message metadata
-PKT_PULL_CHUNK = 5   # Client fetching a specific chunk
-PKT_CHUNK_RESP = 6   # Server returning chunk data
-PKT_PING       = 7   # Connectivity check
-PKT_PONG       = 8   # Pong
+PKT_PUSH_CHUNK        = 1   # Client sending encrypted chunk
+PKT_PUSH_ACK          = 2   # Server ACK chunk
+PKT_POLL_META         = 3   # Client asking for message info for a target tag
+PKT_META_RESP         = 4   # Server returning message metadata
+PKT_PULL_CHUNK        = 5   # Client fetching a specific message chunk
+PKT_CHUNK_RESP        = 6   # Server returning chunk data
+PKT_PING              = 7   # Connectivity check
+PKT_PONG              = 8   # Pong
+PKT_DISCOVER_CHANNELS = 9   # Client discovering active public broadcast channels
+PKT_CHANNELS_RESP     = 10  # Server returning list of active channels
+PKT_PULL_MEDIA        = 11  # Client on-demand media chunk pull (Autodownload OFF)
+PKT_MEDIA_RESP        = 12  # Server returning on-demand media chunk
 
 HEADER_LEN = 22
 HEADER_STRUCT = ">BBH8sIHHH"

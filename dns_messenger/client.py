@@ -28,7 +28,11 @@ from .dns_proto import (
     PKT_PULL_CHUNK,
     PKT_CHUNK_RESP,
     PKT_PING,
-    PKT_PONG
+    PKT_PONG,
+    PKT_DISCOVER_CHANNELS,
+    PKT_CHANNELS_RESP,
+    PKT_PULL_MEDIA,
+    PKT_MEDIA_RESP,
 )
 
 CLIENT_STATE_FILE = DATA_DIR / "client_state.json"
@@ -417,3 +421,60 @@ class DnsTunnelClient:
                 await asyncio.gather(*tasks, return_exceptions=True)
         finally:
             self.stats["is_polling"] = False
+
+    async def discover_public_channels(self) -> List[str]:
+        """Ask server for active public broadcast channels over DNS."""
+        pkt = DnsPacket(PKT_DISCOVER_CHANNELS)
+        resp = await self.send_dns_packet(pkt)
+        if not resp or resp.pkt_type != PKT_CHANNELS_RESP or not resp.payload:
+            return []
+        try:
+            chans = json.loads(resp.payload.decode("utf-8"))
+            for c in chans:
+                c_name = str(c).strip().lower()
+                if c_name and c_name not in self.state["channels"]:
+                    self.join_channel(c_name, password="")
+            return chans
+        except Exception:
+            return []
+
+    async def fetch_media_for_message(self, chat_type: str, target_name: str, msg_id: int) -> Optional[bytes]:
+        """On-demand pull of media chunks over DNS when user clicks download."""
+        store = self.state["channels"] if chat_type == "channel" else self.state["direct"]
+        target = target_name.strip().lower()
+        if target not in store:
+            return None
+
+        chat_info = store[target]
+        tag = chat_info["tag"]
+
+        # Check if already downloaded and cached locally
+        for m in chat_info.get("messages", []):
+            if m.get("msg_id") == msg_id and m.get("file_data"):
+                return bytes.fromhex(m["file_data"])
+
+        pull_pkt = DnsPacket(PKT_PULL_MEDIA, target_tag=tag, msg_id=msg_id, chunk_idx=0)
+        first_resp = await self.send_dns_packet(pull_pkt)
+        if not first_resp or first_resp.pkt_type != PKT_MEDIA_RESP:
+            return None
+
+        total_chunks = first_resp.total_chunks
+        chunks = {0: first_resp.payload}
+
+        for c_idx in range(1, total_chunks):
+            p = DnsPacket(PKT_PULL_MEDIA, target_tag=tag, msg_id=msg_id, chunk_idx=c_idx, total_chunks=total_chunks)
+            r = await self.send_dns_packet(p)
+            if not r or r.pkt_type != PKT_MEDIA_RESP:
+                return None
+            chunks[c_idx] = r.payload
+
+        full_media = b"".join(chunks[i] for i in range(total_chunks))
+
+        # Cache in client message history
+        for m in chat_info.get("messages", []):
+            if m.get("msg_id") == msg_id:
+                m["file_data"] = full_media.hex()
+                self.save_state()
+                break
+
+        return full_media

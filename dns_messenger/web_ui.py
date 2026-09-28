@@ -259,7 +259,7 @@ HTML_INDEX = """<!DOCTYPE html>
                 <input type="file" id="file-selector" style="display: none;" onchange="handleFileSelected()">
                 <button class="btn-file" title="ارسال فایل (حداکثر ۲۰ مگابایت)" onclick="document.getElementById('file-selector').click()">📎</button>
                 <input type="text" class="input-text" id="message-input" placeholder="پیام خود را بنویسید... (ارسال با Enter)" onkeydown="if(event.key === 'Enter') sendMessage()">
-                <button class="btn-primary" onclick="sendMessage()">ارسال</button>
+                <button class="btn-primary" id="send-btn" onclick="sendMessage()">ارسال</button>
             </div>
         </div>
     </div>
@@ -351,18 +351,37 @@ HTML_INDEX = """<!DOCTYPE html>
                     const item = items[name];
                     const div = document.createElement('div');
                     div.className = 'chat-item' + (currentChat === name ? ' active' : '');
-                    div.onclick = () => selectChat(name, item);
-                    const icon = currentTab === 'channels' ? '📢' : '👤';
+                    const isPub = currentTab === 'channels' && (item.is_public || !item.password);
+                    const icon = currentTab === 'channels' ? (isPub ? '📢' : '🔒') : '👤';
+                    const tagLabel = currentTab === 'channels' ? (isPub ? 'همگانی تلگرام' : 'گروه رمزدار') : 'مستقیم';
                     div.innerHTML = `
-                        <div class="chat-avatar">${icon}</div>
-                        <div class="chat-info">
-                            <div class="chat-name">${item.name}</div>
-                            <div class="chat-sub">${item.messages ? item.messages.length : 0} پیام رمز شده</div>
+                        <div class="chat-avatar" onclick="selectChat('${escapeHtml(name)}', {is_public: ${isPub}, password: '${escapeHtml(item.password || '')}'})">${icon}</div>
+                        <div class="chat-info" onclick="selectChat('${escapeHtml(name)}', {is_public: ${isPub}, password: '${escapeHtml(item.password || '')}'})">
+                            <div class="chat-name">${escapeHtml(item.name)}</div>
+                            <div class="chat-sub">${item.messages ? item.messages.length : 0} پیام (${tagLabel})</div>
                         </div>
+                        <button class="btn-outline" style="padding:2px 8px; font-size:0.75rem; color:var(--text-muted);" title="حذف" onclick="deleteChat('${currentTab}', '${escapeHtml(name)}', event)">✕</button>
                     `;
                     list.appendChild(div);
                 }
             } catch(e) {}
+        }
+
+        async function deleteChat(type, name, ev) {
+            if (ev) ev.stopPropagation();
+            if (!confirm(`آیا از حذف "${name}" مطمئن هستید؟`)) return;
+            await fetch('/api/chat/delete', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ type: type, name: name })
+            });
+            if (currentChat === name) {
+                currentChat = null;
+                document.getElementById('input-bar').style.display = 'none';
+                document.getElementById('current-chat-title').innerText = 'لطفاً یک گفتگو را انتخاب کنید';
+                document.getElementById('messages-box').innerHTML = '<div style="text-align: center; color: var(--text-muted); margin-top: 50px;">یک چت یا کانال را انتخاب کنید</div>';
+            }
+            await fetchChats();
         }
 
         function switchTab(tab) {
@@ -379,9 +398,13 @@ HTML_INDEX = """<!DOCTYPE html>
         async function selectChat(name, chatInfo) {
             currentChat = name;
             document.getElementById('input-bar').style.display = 'flex';
-            document.getElementById('current-chat-title').innerText = (currentTab === 'channels' ? 'کانال: ' : 'کاربر: ') + name;
+            const isPub = currentTab === 'channels' && (!chatInfo || chatInfo.is_public || !chatInfo.password);
+            const prefix = currentTab === 'channels' ? (isPub ? 'کانال عمومی: ' : 'گروه رمزدار: ') : 'کاربر: ';
+            document.getElementById('current-chat-title').innerText = prefix + name;
+            document.getElementById('current-chat-sub').innerText = isPub ? 'پخش همگانی از تلگرام (بدون رمز)' : 'رمزنگاری سرتاسری AES-256-GCM';
             await loadMessages();
             fetchChats();
+            pollMessages();
         }
 
         async function loadMessages() {
@@ -422,17 +445,24 @@ HTML_INDEX = """<!DOCTYPE html>
         }
 
         function escapeHtml(text) {
-            return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+            return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
         }
 
+        let isPolling = false;
         async function pollMessages() {
+            if (isPolling) return;
+            isPolling = true;
             try {
-                await fetch('/api/poll', { method: 'POST' });
+                const targetParam = currentChat ? `?target=${encodeURIComponent(currentChat)}` : '';
+                await fetch('/api/poll' + targetParam, { method: 'POST' });
                 if (currentChat) {
                     await loadMessages();
                 }
                 fetchChats();
             } catch(e) {}
+            finally {
+                isPolling = false;
+            }
         }
 
         function handleFileSelected() {
@@ -455,10 +485,15 @@ HTML_INDEX = """<!DOCTYPE html>
             const text = input.value.trim();
             if (!text && !selectedFileBytes) return;
 
+            const sendBtn = document.getElementById('send-btn');
             const progressBar = document.getElementById('upload-progress');
             const progressInner = document.getElementById('progress-inner');
             progressBar.style.display = 'block';
             progressInner.style.width = '30%';
+
+            sendBtn.disabled = true;
+            sendBtn.innerText = 'ارسال...';
+            input.disabled = true;
 
             const formData = new FormData();
             formData.append('type', currentTab);
@@ -477,25 +512,30 @@ HTML_INDEX = """<!DOCTYPE html>
                 const res = await fetch('/api/send', { method: 'POST', body: formData });
                 const result = await res.json();
                 progressInner.style.width = '100%';
-                setTimeout(() => { progressBar.style.display = 'none'; progressInner.style.width = '0%'; }, 500);
 
                 if (!result.ok) {
-                    alert('خطا در ارسال: ' + result.error);
+                    alert('خطا در ارسال: ' + (result.error || 'پکت ارسال نشد'));
                 } else {
                     selectedFileBytes = null;
                     selectedFileName = '';
-                    input.placeholder = 'پیام خود را بنویسید... (ارسال با Enter)';
                     await pollMessages();
                 }
             } catch(e) {
                 alert('خطا در ارسال: ' + e);
+            } finally {
+                setTimeout(() => { progressBar.style.display = 'none'; progressInner.style.width = '0%'; }, 500);
+                sendBtn.disabled = false;
+                sendBtn.innerText = 'ارسال';
+                input.disabled = false;
+                input.placeholder = 'پیام خود را بنویسید... (ارسال با Enter)';
+                input.focus();
             }
         }
 
         function openAddChatModal() {
             document.getElementById('modal-title').innerText = currentTab === 'channels' ? 'عضویت یا ساخت کانال' : 'افزودن گفتگوی مستقیم';
             document.getElementById('modal-name-label').innerText = currentTab === 'channels' ? 'نام کانال:' : 'شناسه کاربر:';
-            document.getElementById('modal-pass-label').innerText = currentTab === 'channels' ? 'رمز AES کانال:' : 'کلید اشتراکی AES:';
+            document.getElementById('modal-pass-label').innerText = currentTab === 'channels' ? 'کلید مشترک AES (رمز عبور):' : 'کلید اشتراکی AES:';
             document.getElementById('modal-name-input').value = '';
             document.getElementById('modal-pass-input').value = '';
             document.getElementById('add-modal').style.display = 'flex';
@@ -508,15 +548,20 @@ HTML_INDEX = """<!DOCTYPE html>
             if (currentTab === 'direct' && !pass) { alert('برای گفتگوی مستقیم، وارد کردن کلید مشترک الزامی است'); return; }
 
             const endpoint = currentTab === 'channels' ? '/api/channel/join' : '/api/direct/add';
-            await fetch(endpoint, {
+            const res = await fetch(endpoint, {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({ name: name, password: pass })
             });
+            const data = await res.json();
+            if (!data.ok) {
+                alert('خطا: ' + (data.error || 'مشکلی رخ داد'));
+                return;
+            }
 
             closeModal('add-modal');
             await fetchChats();
-            selectChat(name);
+            selectChat(name, { name: name, is_public: !pass, password: pass });
         }
 
         async function openSettings() {
@@ -632,6 +677,7 @@ class WebApp:
         self.app.router.add_get("/api/chats", self.chats_handler)
         self.app.router.add_post("/api/channel/join", self.join_channel_handler)
         self.app.router.add_post("/api/direct/add", self.add_direct_handler)
+        self.app.router.add_post("/api/chat/delete", self.delete_chat_handler)
         self.app.router.add_get("/api/messages", self.messages_handler)
         self.app.router.add_post("/api/send", self.send_handler)
         self.app.router.add_post("/api/poll", self.poll_handler)
@@ -653,21 +699,32 @@ class WebApp:
 
     async def join_channel_handler(self, request):
         data = await request.json()
-        name = data.get("name")
-        password = data.get("password")
-        if name and password:
+        name = str(data.get("name", "")).strip().lower()
+        password = str(data.get("password", "")).strip()
+        if name:
             self.client.join_channel(name, password)
             return web.json_response({"ok": True})
-        return web.json_response({"ok": False, "error": "Invalid params"}, status=400)
+        return web.json_response({"ok": False, "error": "نام کانال نمی‌تواند خالی باشد"}, status=400)
 
     async def add_direct_handler(self, request):
         data = await request.json()
-        name = data.get("name")
-        password = data.get("password")
+        name = str(data.get("name", "")).strip().lower()
+        password = str(data.get("password", "")).strip()
         if name and password:
             self.client.add_direct_chat(name, password)
             return web.json_response({"ok": True})
-        return web.json_response({"ok": False, "error": "Invalid params"}, status=400)
+        return web.json_response({"ok": False, "error": "نام کاربر و کلید رمزگذاری الزامی است"}, status=400)
+
+    async def delete_chat_handler(self, request):
+        data = await request.json()
+        chat_type = data.get("type", "channels")
+        name = str(data.get("name", "")).strip().lower()
+        key = "channels" if chat_type in ("channel", "channels") else "direct"
+        if name in self.client.state.get(key, {}):
+            del self.client.state[key][name]
+            self.client.save_state()
+            return web.json_response({"ok": True})
+        return web.json_response({"ok": False, "error": "چت یافت نشد"}, status=404)
 
     async def messages_handler(self, request):
         chat_type = request.query.get("type", "channels")
@@ -710,7 +767,8 @@ class WebApp:
         return web.json_response({"ok": ok, "error": msg if not ok else ""})
 
     async def poll_handler(self, request):
-        await self.client.poll_all()
+        target = request.query.get("target")
+        await self.client.poll_all(target_priority=target)
         return web.json_response({"ok": True})
 
     async def file_download_handler(self, request):

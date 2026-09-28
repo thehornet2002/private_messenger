@@ -385,13 +385,35 @@ class DnsTunnelClient:
         except Exception:
             return 0
 
-    async def poll_all(self):
-        """Poll all active channels and direct chats."""
+    async def poll_all(self, target_priority: Optional[str] = None):
+        """Poll active channels and direct chats. If target_priority is specified, poll that first."""
+        if self.stats.get("is_polling"):
+            return
         self.stats["is_polling"] = True
         try:
+            # 1. If a specific chat is actively opened by user, poll it immediately
+            if target_priority:
+                target_p = target_priority.strip().lower()
+                if target_p in self.state["channels"]:
+                    await self.poll_target("channel", target_p)
+                elif target_p in self.state["direct"]:
+                    await self.poll_target("direct", target_p)
+
+            # 2. Poll other channels concurrently in parallel with bounded semaphore
+            sem = asyncio.Semaphore(3)
+            async def _poll_one(ctype, name):
+                if target_priority and name == target_priority.strip().lower():
+                    return
+                async with sem:
+                    await self.poll_target(ctype, name)
+
+            tasks = []
             for chan_name in list(self.state["channels"].keys()):
-                await self.poll_target("channel", chan_name)
+                tasks.append(_poll_one("channel", chan_name))
             for user_name in list(self.state["direct"].keys()):
-                await self.poll_target("direct", user_name)
+                tasks.append(_poll_one("direct", user_name))
+
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
         finally:
             self.stats["is_polling"] = False

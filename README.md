@@ -30,7 +30,7 @@
 یک اسکریپت خودکار برای نصب پیش‌نیازها، تنظیم سرویس systemd و باز کردن فایروال آماده شده است:
 
 ```bash
-git clone https://github.com/your-username/dns-messenger.git
+git clone https://github.com/thehornet2002/dns-messenger.git
 cd dns-messenger
 chmod +x install_ubuntu.sh
 sudo ./install_ubuntu.sh

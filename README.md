@@ -31,7 +31,7 @@
 
 ```bash
 git clone https://github.com/thehornet2002/private_messenger.git
-cd dns-messenger
+cd private_messenger
 chmod +x install_ubuntu.sh
 sudo ./install_ubuntu.sh
 ```

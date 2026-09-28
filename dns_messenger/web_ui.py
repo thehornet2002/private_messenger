@@ -7,7 +7,6 @@ from aiohttp import web
 from .config import load_config, save_config, DATA_DIR, RESOLVERS_FILE, load_resolvers, save_resolvers
 from .client import DnsTunnelClient
 from .crypto import get_message_file_bytes
-from .telegram_tracker import TelegramTracker
 
 HTML_INDEX = """<!DOCTYPE html>
 <html lang="fa" dir="rtl">
@@ -270,12 +269,15 @@ HTML_INDEX = """<!DOCTYPE html>
         <div class="modal-card">
             <h3 id="modal-title">عضویت یا ساخت کانال</h3>
             <div class="form-group">
-                <label id="modal-name-label">نام کانال:</label>
-                <input type="text" id="modal-name-input" placeholder="مثال: news یا private_updates">
+                <label id="modal-name-label">نام کانال / شناسه چت:</label>
+                <input type="text" id="modal-name-input" placeholder="مثال: news یا dev_group">
             </div>
             <div class="form-group">
-                <label id="modal-pass-label">کلید رمزنگاری AES (رمز عبور):</label>
-                <input type="password" id="modal-pass-input" placeholder="رمزی که فقط اعضای این کانال می‌دانند">
+                <label id="modal-pass-label">کلید مشترک AES (رمز عبور):</label>
+                <input type="password" id="modal-pass-input" placeholder="برای کانال‌های همگانی تلگرام خالی بگذارید">
+                <span id="modal-pass-hint" style="font-size: 0.75rem; color: var(--text-muted); margin-top: 2px;">
+                    💡 هر فردی که این رمز را وارد کند عضو گروه مشترک شده و می‌تواند پیام بخواند و ارسال کند.
+                </span>
             </div>
             <div style="display: flex; gap: 8px; justify-content: flex-end; margin-top: 10px;">
                 <button class="btn-outline" onclick="closeModal('add-modal')">انصراف</button>
@@ -286,39 +288,27 @@ HTML_INDEX = """<!DOCTYPE html>
 
     <!-- Modal for Settings -->
     <div class="modal" id="settings-modal">
-        <div class="modal-card" style="width: 540px;">
-            <h3>تنظیمات سیستم و تونل DNS</h3>
+        <div class="modal-card" style="width: 520px;">
+            <h3>تنظیمات کلاینت و تونل DNS</h3>
             <div class="form-group">
                 <label>دامنه پایه DNS Tunnel (Base Domain):</label>
                 <input type="text" id="cfg-base-domain" placeholder="msg.example.com">
             </div>
             <div class="form-group">
                 <div style="display: flex; justify-content: space-between; align-items: center;">
-                    <label>فایل اختصاصی رسیورها (resolvers.txt) - فرمت IP یا IP:PORT:</label>
+                    <label>فایل اختصاصی رسیورها (resolvers.txt):</label>
                     <button type="button" class="btn-primary" style="font-size: 0.75rem; padding: 3px 8px;" onclick="benchmarkResolvers()">⚡ تست سرعت و رتبه‌بندی</button>
                 </div>
                 <textarea id="cfg-resolvers-raw" rows="4" style="font-family: monospace; font-size: 0.85rem;" placeholder="1.1.1.1:53&#10;8.8.8.8:53&#10;9.9.9.9:53"></textarea>
                 <div id="benchmark-results" style="font-size: 0.78rem; color: #4cd964; display: none; margin-top: 4px;"></div>
             </div>
             <div class="form-group">
-                <label>حداکثر حجم مجاز هر فایل (مگابایت):</label>
+                <label>حداکثر حجم مجاز هر فایل ارسالی (مگابایت):</label>
                 <input type="number" id="cfg-max-file" value="20" min="1" max="100">
             </div>
-            <hr style="border: 0; border-top: 1px solid var(--border-color); margin: 6px 0;">
-            <h4>ردیاب خودکار کانال‌های تلگرام (Kurigram Self-Bot)</h4>
             <div class="form-group">
-                <label><input type="checkbox" id="cfg-tg-enabled"> فعال‌سازی ردیاب خودکار کانال تلگرام</label>
-            </div>
-            <div class="form-group">
-                <label>Telegram API ID / Hash:</label>
-                <div style="display: flex; gap: 6px;">
-                    <input type="text" id="cfg-tg-api-id" placeholder="API ID" style="width: 40%;">
-                    <input type="text" id="cfg-tg-api-hash" placeholder="API Hash" style="width: 60%;">
-                </div>
-            </div>
-            <div class="form-group">
-                <label>نگاشت کانال‌ها (فرمت JSON):</label>
-                <textarea id="cfg-tg-map" rows="3" placeholder='[{"tg_channel": "@my_channel", "messenger_channel": "tech", "password": "pass"}]'></textarea>
+                <label>نام مستعار شما در چت‌ها (Username):</label>
+                <input type="text" id="cfg-username" placeholder="Anonymous">
             </div>
             <div style="display: flex; gap: 8px; justify-content: flex-end; margin-top: 10px;">
                 <button class="btn-outline" onclick="closeModal('settings-modal')">بستن</button>
@@ -514,7 +504,8 @@ HTML_INDEX = """<!DOCTYPE html>
         async function submitAddChat() {
             const name = document.getElementById('modal-name-input').value.trim();
             const pass = document.getElementById('modal-pass-input').value.trim();
-            if (!name || !pass) { alert('لطفاً همه فیلدها را پر کنید'); return; }
+            if (!name) { alert('لطفاً نام کانال یا کاربر را وارد کنید'); return; }
+            if (currentTab === 'direct' && !pass) { alert('برای گفتگوی مستقیم، وارد کردن کلید مشترک الزامی است'); return; }
 
             const endpoint = currentTab === 'channels' ? '/api/channel/join' : '/api/direct/add';
             await fetch(endpoint, {
@@ -538,11 +529,9 @@ HTML_INDEX = """<!DOCTYPE html>
             const resData = await resResolvers.json();
             document.getElementById('cfg-resolvers-raw').value = resData.raw || '';
 
-            const tg = cfg.kurigram_tracker || {};
-            document.getElementById('cfg-tg-enabled').checked = !!tg.enabled;
-            document.getElementById('cfg-tg-api-id').value = tg.api_id || '';
-            document.getElementById('cfg-tg-api-hash').value = tg.api_hash || '';
-            document.getElementById('cfg-tg-map').value = JSON.stringify(tg.channels_map || [], null, 2);
+            const resChats = await fetch('/api/chats');
+            const chatsData = await resChats.json();
+            document.getElementById('cfg-username').value = chatsData.username || '';
 
             document.getElementById('settings-modal').style.display = 'flex';
         }
@@ -571,22 +560,31 @@ HTML_INDEX = """<!DOCTYPE html>
             const base_domain = document.getElementById('cfg-base-domain').value.trim();
             const rawResolvers = document.getElementById('cfg-resolvers-raw').value.trim();
             const max_file = parseInt(document.getElementById('cfg-max-file').value) || 20;
-            const tg_enabled = document.getElementById('cfg-tg-enabled').checked;
-            const tg_api_id = parseInt(document.getElementById('cfg-tg-api-id').value) || 0;
-            const tg_api_hash = document.getElementById('cfg-tg-api-hash').value.trim();
-
-            let tg_map = [];
-            try {
-                tg_map = JSON.parse(document.getElementById('cfg-tg-map').value);
-            } catch(e) {
-                alert('فرمت JSON نگاشت کانال تلگرام نامعتبر است');
-                return;
-            }
+            const username = document.getElementById('cfg-username').value.trim();
 
             // Save resolvers.txt
             await fetch('/api/resolvers', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ raw: rawResolvers })
+            });
+
+            const body = {
+                base_domain,
+                max_file_size_mb: max_file,
+                username: username
+            };
+
+            await fetch('/api/config', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(body)
+            });
+
+            closeModal('settings-modal');
+            alert('تنظیمات با موفقیت ذخیره شد.');
+            await fetchStatus();
+        }
                 body: JSON.stringify({ raw: rawResolvers })
             });
 
@@ -623,9 +621,8 @@ HTML_INDEX = """<!DOCTYPE html>
 """
 
 class WebApp:
-    def __init__(self, dns_client: DnsTunnelClient, tracker: TelegramTracker):
+    def __init__(self, dns_client: DnsTunnelClient):
         self.client = dns_client
-        self.tracker = tracker
         self.app = web.Application()
         self._setup_routes()
 

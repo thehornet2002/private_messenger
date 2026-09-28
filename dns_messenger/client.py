@@ -233,19 +233,24 @@ class DnsTunnelClient:
         return resp is not None and resp.pkt_type == PKT_PONG
 
     # Channel & Chat Management
-    def join_channel(self, channel_name: str, password: str):
+    def join_channel(self, channel_name: str, password: str = ""):
         chan_name = channel_name.strip().lower()
         tag = get_target_tag(chan_name, prefix="chan")
+        pwd = password.strip()
+        is_public = (len(pwd) == 0)
+
         if chan_name not in self.state["channels"]:
             self.state["channels"][chan_name] = {
                 "name": chan_name,
-                "password": password,
+                "password": pwd,
+                "is_public": is_public,
                 "tag": tag,
                 "last_seen_id": 0,
                 "messages": []
             }
         else:
-            self.state["channels"][chan_name]["password"] = password
+            self.state["channels"][chan_name]["password"] = pwd
+            self.state["channels"][chan_name]["is_public"] = is_public
             self.state["channels"][chan_name]["tag"] = tag
         self.save_state()
 
@@ -256,6 +261,7 @@ class DnsTunnelClient:
             self.state["direct"][peer] = {
                 "name": peer,
                 "password": shared_key,
+                "is_public": False,
                 "tag": tag,
                 "last_seen_id": 0,
                 "messages": []
@@ -281,8 +287,9 @@ class DnsTunnelClient:
             return False, "Target not found in chats"
 
         chat_info = store[target]
-        password = chat_info["password"]
+        password = chat_info.get("password", "").strip() or None
         tag = chat_info["tag"]
+        is_public = (password is None)
 
         if file_bytes:
             max_bytes = self.max_file_size_mb * 1024 * 1024
@@ -290,7 +297,7 @@ class DnsTunnelClient:
                 return False, f"File size exceeds limit of {self.max_file_size_mb} MB"
 
         sender = self.state.get("username", "Anonymous")
-        packed = pack_message(sender=sender, text=text, file_name=file_name, file_bytes=file_bytes)
+        packed = pack_message(sender=sender, text=text, file_name=file_name, file_bytes=file_bytes, is_public=is_public)
         encrypted_blob = encrypt_payload(packed, password)
 
         # Split encrypted blob into DNS chunks
@@ -358,16 +365,18 @@ class DnsTunnelClient:
             return 0
 
         full_encrypted = b"".join(chunks[i] for i in range(total_chunks))
-        decrypted = decrypt_payload(full_encrypted, password)
-        if not decrypted:
+        res = decrypt_payload(full_encrypted, password)
+        if not res:
             # Password mismatch or corrupted
             chat_info["last_seen_id"] = next_msg_id
             self.save_state()
             return 0
 
+        raw_bytes, is_pub = res
         try:
-            msg_obj = unpack_message(decrypted)
+            msg_obj = unpack_message(raw_bytes)
             msg_obj["msg_id"] = next_msg_id
+            msg_obj["is_public"] = is_pub
             msg_obj["timestamp"] = int(time.time())
             chat_info["messages"].append(msg_obj)
             chat_info["last_seen_id"] = next_msg_id

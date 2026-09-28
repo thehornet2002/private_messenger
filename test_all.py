@@ -1,13 +1,11 @@
 import asyncio
 import os
-import sqlite3
-from dns_messenger.server import DnsTunnelServerProtocol
+from dns_messenger.server import DnsTunnelServerProtocol, GLOBAL_MEMORY_STORE
 from dns_messenger.client import DnsTunnelClient
-from dns_messenger.crypto import get_message_file_bytes
-from dns_messenger.config import DATA_DIR
+from dns_messenger.crypto import get_message_file_bytes, get_target_tag, pack_message, encrypt_payload
 
 async def run_full_suite():
-    print("[1/6] Starting In-Memory DNS Server on 127.0.0.1:5399...")
+    print("[1/6] Starting In-Memory Ephemeral DNS Server on 127.0.0.1:5399...")
     cfg = {
         "base_domain": "tunnel.msg.local",
         "server_listen_host": "127.0.0.1",
@@ -16,7 +14,7 @@ async def run_full_suite():
     }
     loop = asyncio.get_running_loop()
     transport, protocol = await loop.create_datagram_endpoint(
-        lambda: DnsTunnelServerProtocol(cfg),
+        lambda: DnsTunnelServerProtocol(cfg, GLOBAL_MEMORY_STORE),
         local_addr=("127.0.0.1", 5399)
     )
 
@@ -29,55 +27,82 @@ async def run_full_suite():
     assert await client1.ping(), "Ping test failed"
     print("  -> Ping OK!")
 
-    print("[3/6] Testing Channel Creation & AES-256-GCM Encryption...")
-    channel_name = "test_channel"
-    channel_pass = "SecurePassphrase123!#"
-    client1.join_channel(channel_name, channel_pass)
+    print("[3/6] Testing Public / Telegram Broadcast (No password)...")
+    # Simulate server injecting a Telegram post into ephemeral RAM
+    pub_tag = get_target_tag("news", prefix="chan")
+    pub_packed = pack_message(sender="📢 Telegram [@breaking]", text="Public News Alert!", is_public=True)
+    pub_enc = encrypt_payload(pub_packed, password=None)
+    new_id = GLOBAL_MEMORY_STORE.get_next_msg_id(pub_tag)
+    GLOBAL_MEMORY_STORE.save_message(pub_tag, new_id, pub_enc)
 
-    ok, msg = await client1.send_message("channel", channel_name, text="Hello DNS Tunnel World!")
-    assert ok, f"Send failed: {msg}"
-    print("  -> Message sent over DNS packets successfully!")
-
-    print("[4/6] Verifying Server-Side Zero Knowledge...")
-    db_file = DATA_DIR / "server_messages.db"
-    with sqlite3.connect(db_file) as conn:
-        rows = conn.execute("SELECT target_tag, encrypted_data FROM messages").fetchall()
-        assert len(rows) > 0, "No messages found in server DB"
-        tag, enc = rows[-1]
-        print(f"  -> Server raw tag: {tag} (16 hex chars)")
-        print(f"  -> Server ciphertext starts with: {enc[:16].hex()}... (Plaintext nowhere found)")
-        assert b"Hello DNS Tunnel World!" not in enc, "Plaintext leaked to server!"
-    print("  -> Zero Knowledge Verified!")
-
-    print("[5/6] Testing Channel Message Sync & Decryption...")
+    # Client joins public channel with NO password
     client2 = DnsTunnelClient()
     client2.resolvers = ["127.0.0.1:5399"]
     client2.base_domain = "tunnel.msg.local"
-    client2.join_channel(channel_name, channel_pass)
+    client2.join_channel("news", password="")  # Public
 
-    fetched = await client2.poll_target("channel", channel_name)
-    assert fetched == 1, f"Expected 1 fetched message, got {fetched}"
-    last_msg = client2.state["channels"][channel_name]["messages"][-1]
-    assert last_msg["text"] == "Hello DNS Tunnel World!"
-    print(f"  -> Client2 Decrypted: '{last_msg['text']}'")
+    fetched = await client2.poll_target("channel", "news")
+    assert fetched == 1, f"Expected 1 fetched public message, got {fetched}"
+    pub_msg = client2.state["channels"]["news"]["messages"][-1]
+    assert pub_msg["is_public"] is True
+    assert "Public News Alert!" in pub_msg["text"]
+    print(f"  -> Client received public broadcast: '{pub_msg['text']}'")
 
-    print("[6/6] Testing Binary File Transfer Over DNS...")
-    test_file_bytes = b"BINARY_DATA_TEST_FILE_CONTENT_" * 60  # ~1.8KB chunked
+    print("[4/6] Testing Private Encrypted Group Chat (AES-256-GCM)...")
+    secret_pass = "UltraSecretGroupPassword123"
+    client1.join_channel("secret_room", secret_pass)
+    ok, err = await client1.send_message("channel", "secret_room", text="Confidential Group Message")
+    assert ok, f"Send failed: {err}"
+
+    # Verify server holds ZERO plaintext in RAM
+    sec_tag = get_target_tag("secret_room", prefix="chan")
+    server_blob = GLOBAL_MEMORY_STORE.get_message(sec_tag, 1)
+    assert server_blob is not None
+    assert b"Confidential Group Message" not in server_blob, "Plaintext leaked in server RAM!"
+    print(f"  -> Server RAM payload: {server_blob[:12].hex()}... (Plaintext nowhere found)")
+
+    # Client2 joins with correct password
+    client2.join_channel("secret_room", secret_pass)
+    fetched_sec = await client2.poll_target("channel", "secret_room")
+    assert fetched_sec == 1, "Failed to fetch private message"
+    assert client2.state["channels"]["secret_room"]["messages"][-1]["text"] == "Confidential Group Message"
+    print("  -> Client2 decrypted group message successfully!")
+
+    # Client3 joins with WRONG password -> cannot read
+    client3 = DnsTunnelClient()
+    client3.resolvers = ["127.0.0.1:5399"]
+    client3.base_domain = "tunnel.msg.local"
+    client3.join_channel("secret_room", "WrongPassword")
+    fetched_wrong = await client3.poll_target("channel", "secret_room")
+    assert fetched_wrong == 0, "Wrong password must not decrypt message"
+    print("  -> Wrong password client rejected correctly!")
+
+    print("[5/6] Testing Binary File Transfer Over DNS...")
+    test_file_bytes = b"BINARY_DATA_TEST_FILE_CONTENT_" * 60
     ok, msg = await client1.send_message(
         chat_type="channel",
-        target_name=channel_name,
+        target_name="secret_room",
         text="Sending attachment",
         file_name="secret_doc.bin",
         file_bytes=test_file_bytes
     )
     assert ok, f"File send failed: {msg}"
 
-    fetched_file = await client2.poll_target("channel", channel_name)
+    fetched_file = await client2.poll_target("channel", "secret_room")
     assert fetched_file == 1, "File message pull failed"
-    file_msg = client2.state["channels"][channel_name]["messages"][-1]
+    file_msg = client2.state["channels"]["secret_room"]["messages"][-1]
     recovered_bytes = get_message_file_bytes(file_msg)
     assert recovered_bytes == test_file_bytes, "File byte mismatch!"
     print(f"  -> File '{file_msg['file_name']}' received and verified successfully!")
+
+    print("[6/6] Checking In-Memory Stats & Zero Disk Writes...")
+    stats = GLOBAL_MEMORY_STORE.stats
+    print(f"  -> Total queries handled: {stats['total_queries']}")
+    print(f"  -> Messages received in RAM: {stats['total_messages_received']}")
+    print(f"  -> Bytes transferred: {stats['total_bytes_transferred']}")
+    assert stats["total_queries"] > 5
+    assert not os.path.exists("data/server_messages.db"), "Server must NOT create any sqlite database file!"
+    print("  -> Zero-Knowledge In-Memory Architecture Verified!")
 
     transport.close()
     print("\n=======================================================")

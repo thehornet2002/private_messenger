@@ -151,6 +151,8 @@ cat > "$INSTALL_DIR/data/config.json" << EOF
   "chunk_size_bytes": 110,
   "web_host": "127.0.0.1",
   "web_port": 8080,
+  "server_admin_host": "0.0.0.0",
+  "server_admin_port": 8081,
   "kurigram_tracker": {
     "enabled": false,
     "api_id": 0,
@@ -198,8 +200,9 @@ systemctl restart "${SERVICE_NAME}"
 
 # 11. Firewall Configuration (UFW)
 if ufw status | grep -q "Status: active"; then
-    echo -e "${BLUE}[6/6] Allowing UDP port ${LISTEN_PORT} in UFW firewall...${NC}"
-    ufw allow "${LISTEN_PORT}/udp" comment "DNS Messenger Server" >/dev/null || true
+    echo -e "${BLUE}[6/6] Allowing UDP port ${LISTEN_PORT} and Admin Web Port 8081 in UFW firewall...${NC}"
+    ufw allow "${LISTEN_PORT}/udp" comment "DNS Messenger UDP" >/dev/null || true
+    ufw allow "8081/tcp" comment "DNS Messenger Admin Web" >/dev/null || true
 fi
 
 # 12. Verification & Self-Test
@@ -215,6 +218,9 @@ fi
 
 PUBLIC_IP=$(curl -s -4 ifconfig.me || curl -s -4 icanhazip.com || echo "YOUR_SERVER_IP")
 
+echo -e "${CYAN}==================================================================${NC}"
+echo -e "${GREEN}Server Web Admin Dashboard: http://${PUBLIC_IP}:8081${NC}"
+echo -e "  (Open in your browser to monitor stats, login to Telegram Kurigram bot & map channels)"
 echo -e "${CYAN}==================================================================${NC}"
 echo -e "${YELLOW}Next Steps - Configure DNS Records on Cloudflare or Domain Registrar:${NC}"
 echo -e "  1. Create an ${GREEN}A Record${NC}:"

@@ -1,13 +1,14 @@
 import asyncio
 import socket
-import sqlite3
 import time
 import math
+from collections import deque
 from pathlib import Path
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, List
 import dns.message
 import dns.query
-from .config import load_config, DATA_DIR
+from aiohttp import web
+from .config import load_config
 from .dns_proto import (
     DnsPacket,
     domain_to_bytes,
@@ -22,69 +23,85 @@ from .dns_proto import (
     PKT_PONG,
 )
 
-CHUNK_PULL_SIZE = 380  # Max safe bytes in TXT record response without IP fragmentation
+CHUNK_PULL_SIZE = 380
 
-class MessageStore:
-    def __init__(self, db_path: Path):
-        self.db_path = db_path
-        self._init_db()
+class EphemeralMemoryStore:
+    """
+    100% In-Memory Ephemeral Store.
+    Zero data is written to disk. Messages are stored only in RAM
+    as a temporary ring buffer and automatically expire after TTL.
+    """
+    def __init__(self, ttl_seconds: int = 7200, max_per_tag: int = 100):
+        self.ttl = ttl_seconds
+        self.max_per_tag = max_per_tag
+        # { target_tag: deque([(msg_id, timestamp, encrypted_bytes), ...], maxlen=100) }
+        self._buffers: Dict[str, deque] = {}
+        self._next_id: Dict[str, int] = {}
+        self.stats = {
+            "start_time": time.time(),
+            "total_queries": 0,
+            "total_messages_received": 0,
+            "total_messages_delivered": 0,
+            "total_bytes_transferred": 0,
+            "active_tags_count": 0
+        }
 
-    def _init_db(self):
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS messages (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    target_tag TEXT NOT NULL,
-                    msg_id INTEGER NOT NULL,
-                    timestamp REAL NOT NULL,
-                    encrypted_data BLOB NOT NULL
-                )
-            """)
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_tag_msg ON messages(target_tag, msg_id)")
+    def _purge_expired(self):
+        now = time.time()
+        for tag, q in list(self._buffers.items()):
+            while q and (now - q[0][1] > self.ttl):
+                q.popleft()
+            if not q:
+                del self._buffers[tag]
+        self.stats["active_tags_count"] = len(self._buffers)
 
     def get_next_msg_id(self, target_tag: str) -> int:
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT MAX(msg_id) FROM messages WHERE target_tag = ?", (target_tag,))
-            row = cursor.fetchone()
-            return (row[0] or 0) + 1
+        cur = self._next_id.get(target_tag, 0) + 1
+        self._next_id[target_tag] = cur
+        return cur
 
-    def save_message(self, target_tag: str, msg_id: int, encrypted_data: bytes):
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute(
-                "INSERT INTO messages (target_tag, msg_id, timestamp, encrypted_data) VALUES (?, ?, ?, ?)",
-                (target_tag, msg_id, time.time(), encrypted_data)
-            )
+    def save_message(self, target_tag: str, msg_id: int, data: bytes):
+        self._purge_expired()
+        if target_tag not in self._buffers:
+            self._buffers[target_tag] = deque(maxlen=self.max_per_tag)
+        self._buffers[target_tag].append((msg_id, time.time(), data))
+        self.stats["total_messages_received"] += 1
+        self.stats["total_bytes_transferred"] += len(data)
+        self.stats["active_tags_count"] = len(self._buffers)
 
-    def get_messages_after(self, target_tag: str, last_seen_id: int, limit: int = 1):
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT msg_id, encrypted_data FROM messages WHERE target_tag = ? AND msg_id > ? ORDER BY msg_id ASC LIMIT ?",
-                (target_tag, last_seen_id, limit)
-            )
-            return cursor.fetchall()
+    def get_messages_after(self, target_tag: str, last_seen_id: int, limit: int = 1) -> List[Tuple[int, bytes]]:
+        self._purge_expired()
+        if target_tag not in self._buffers:
+            return []
+        results = []
+        for msg_id, _, data in self._buffers[target_tag]:
+            if msg_id > last_seen_id:
+                results.append((msg_id, data))
+                if len(results) >= limit:
+                    break
+        return results
 
     def get_message(self, target_tag: str, msg_id: int) -> Optional[bytes]:
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT encrypted_data FROM messages WHERE target_tag = ? AND msg_id = ?",
-                (target_tag, msg_id)
-            )
-            row = cursor.fetchone()
-            return row[0] if row else None
+        self._purge_expired()
+        if target_tag not in self._buffers:
+            return None
+        for m_id, _, data in self._buffers[target_tag]:
+            if m_id == msg_id:
+                self.stats["total_messages_delivered"] += 1
+                return data
+        return None
 
+# Global in-memory store for server runtime
+GLOBAL_MEMORY_STORE = EphemeralMemoryStore()
 
 class DnsTunnelServerProtocol(asyncio.DatagramProtocol):
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, store: Optional[EphemeralMemoryStore] = None):
         self.config = config
         self.base_domain = config.get("base_domain", "msg.example.com").lower()
         self.max_file_size = config.get("max_file_size_mb", 20) * 1024 * 1024
         self.forward_upstream = config.get("forward_dns_upstream", "")
         self.transport = None
-        self.store = MessageStore(DATA_DIR / "server_messages.db")
-        # In-flight incoming chunks: {(target_tag, msg_id): {chunk_idx: bytes, 'total': int, 'time': float}}
+        self.store = store or GLOBAL_MEMORY_STORE
         self.incoming_assembly: Dict[Tuple[str, int], dict] = {}
 
     def connection_made(self, transport):
@@ -94,6 +111,7 @@ class DnsTunnelServerProtocol(asyncio.DatagramProtocol):
         asyncio.create_task(self.handle_datagram(data, addr))
 
     async def handle_datagram(self, data: bytes, addr: Tuple[str, int]):
+        self.store.stats["total_queries"] += 1
         try:
             query = dns.message.from_wire(data)
         except Exception:
@@ -106,7 +124,6 @@ class DnsTunnelServerProtocol(asyncio.DatagramProtocol):
 
         # Check if query is for our tunnel domain
         if not qname.endswith(self.base_domain):
-            # Transparent forward to MasterDNS / Upstream DNS if configured
             if self.forward_upstream:
                 await self.forward_to_upstream(data, addr)
             return
@@ -125,7 +142,6 @@ class DnsTunnelServerProtocol(asyncio.DatagramProtocol):
             self.transport.sendto(resp_wire.to_wire(), addr)
 
     def process_tunnel_packet(self, pkt: DnsPacket) -> Optional[DnsPacket]:
-        # Clean stale incoming assemblies older than 10 minutes
         now = time.time()
         stale = [k for k, v in self.incoming_assembly.items() if now - v["time"] > 600]
         for k in stale:
@@ -135,7 +151,6 @@ class DnsTunnelServerProtocol(asyncio.DatagramProtocol):
             return DnsPacket(PKT_PONG, session_id=pkt.session_id, target_tag=pkt.target_tag)
 
         elif pkt.pkt_type == PKT_PUSH_CHUNK:
-            # Check maximum size
             if pkt.total_chunks * len(pkt.payload) > self.max_file_size:
                 return None
 
@@ -151,7 +166,6 @@ class DnsTunnelServerProtocol(asyncio.DatagramProtocol):
             assembly["chunks"][pkt.chunk_idx] = pkt.payload
             assembly["time"] = now
 
-            # If all chunks arrived, assemble and store message
             if len(assembly["chunks"]) == assembly["total"]:
                 full_bytes = b"".join(assembly["chunks"][i] for i in range(assembly["total"]))
                 new_id = self.store.get_next_msg_id(pkt.target_tag)
@@ -176,7 +190,6 @@ class DnsTunnelServerProtocol(asyncio.DatagramProtocol):
             )
 
         elif pkt.pkt_type == PKT_POLL_META:
-            # pkt.msg_id is client's last seen msg_id
             rows = self.store.get_messages_after(pkt.target_tag, pkt.msg_id, limit=1)
             if not rows:
                 return DnsPacket(
@@ -242,22 +255,45 @@ class DnsTunnelServerProtocol(asyncio.DatagramProtocol):
 
 
 async def run_server():
+    from .server_admin_ui import ServerAdminApp
+    from .telegram_server_bot import GLOBAL_TELEGRAM_BOT
+
     cfg = load_config()
     host = cfg.get("server_listen_host", "0.0.0.0")
     port = cfg.get("server_listen_port", 5354)
     loop = asyncio.get_running_loop()
+
+    # 1. Start DNS Tunnel UDP Server
     transport, protocol = await loop.create_datagram_endpoint(
-        lambda: DnsTunnelServerProtocol(cfg),
+        lambda: DnsTunnelServerProtocol(cfg, GLOBAL_MEMORY_STORE),
         local_addr=(host, port)
     )
-    print(f"[DNS Messenger Server] Listening on {host}:{port}")
-    print(f"[DNS Messenger Server] Base domain: {cfg.get('base_domain')}")
-    if cfg.get("forward_dns_upstream"):
-        print(f"[DNS Messenger Server] Upstream fallback (MasterDNS co-exist): {cfg.get('forward_dns_upstream')}")
+
+    # 2. Start Server Web Admin Dashboard
+    admin_app = ServerAdminApp()
+    admin_runner = web.AppRunner(admin_app.app)
+    await admin_runner.setup()
+    admin_host = cfg.get("server_admin_host", "0.0.0.0")
+    admin_port = cfg.get("server_admin_port", 8081)
+    admin_site = web.TCPSite(admin_runner, admin_host, admin_port)
+    await admin_site.start()
+
+    # 3. Start Telegram Kurigram Server Bot if configured
+    asyncio.create_task(GLOBAL_TELEGRAM_BOT.start_from_config())
+
+    print("\n=======================================================")
+    print(f"DNS Messenger Server active on UDP {host}:{port}")
+    print(f"Server Web Admin Panel: http://{admin_host}:{admin_port}")
+    print(f"Base Domain: {cfg.get('base_domain')}")
+    print(f"Memory Architecture: 100% In-Memory RAM Ring Buffer (Zero Disk Writes)")
+    print("=======================================================\n")
+
     try:
         while True:
             await asyncio.sleep(3600)
     finally:
+        await GLOBAL_TELEGRAM_BOT.stop()
+        await admin_runner.cleanup()
         transport.close()
 
 if __name__ == "__main__":

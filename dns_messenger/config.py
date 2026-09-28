@@ -97,9 +97,13 @@ DEFAULT_CONFIG = {
     "max_file_size_mb": 20,
     "chunk_size_bytes": 110,  # Optimal for base32 labels within 253-byte DNS domain
     
-    # Web UI Settings
+    # Web UI Settings (Client)
     "web_host": "127.0.0.1",
     "web_port": 8080,
+
+    # Server Admin Panel Settings (Server VPS)
+    "server_admin_host": "0.0.0.0",
+    "server_admin_port": 8081,
     
     # Kurigram Telegram Self-Bot Tracker Settings
     "kurigram_tracker": {

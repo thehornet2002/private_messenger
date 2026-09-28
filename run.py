@@ -6,7 +6,6 @@ from aiohttp import web
 from dns_messenger.config import load_config
 from dns_messenger.server import run_server
 from dns_messenger.client import DnsTunnelClient
-from dns_messenger.telegram_tracker import TelegramTracker
 from dns_messenger.web_ui import WebApp
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -14,13 +13,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 async def start_client_app():
     cfg = load_config()
     client = DnsTunnelClient()
-    tracker = TelegramTracker(client)
-    
-    # Start Telegram Kurigram Tracker if enabled
-    if cfg.get("kurigram_tracker", {}).get("enabled", False):
-        asyncio.create_task(tracker.start())
-        
-    web_app = WebApp(client, tracker)
+    web_app = WebApp(client)
     runner = web.AppRunner(web_app.app)
     await runner.setup()
     
@@ -40,7 +33,6 @@ async def start_client_app():
         while True:
             await asyncio.sleep(3600)
     finally:
-        await tracker.stop()
         await runner.cleanup()
 
 async def main():

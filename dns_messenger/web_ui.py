@@ -228,9 +228,9 @@ HTML_INDEX = """<!DOCTYPE html>
             <div class="chat-list" id="chat-list">
                 <!-- Dynamically populated -->
             </div>
-            <div class="sidebar-bottom" style="display: flex; flex-direction: column; gap: 8px;">
-                <button class="btn-primary" style="width: 100%; background: #2563eb;" id="btn-discover-side" onclick="requestPublicChannels()">📡 دریافت کانال‌های عمومی از سرور</button>
-                <button class="btn-outline" style="width: 100%;" onclick="openAddChatModal()">➕ ایجاد یا عضویت دستی</button>
+            <div class="sidebar-bottom" id="sidebar-bottom-actions">
+                <button class="btn-primary" style="width: 100%; background: #2563eb;" id="btn-discover-side" onclick="requestPublicChannels()">📡 دریافت و بروزرسانی کانال‌ها از سرور</button>
+                <button class="btn-primary" style="width: 100%; display: none;" id="btn-add-direct" onclick="openAddChatModal()">➕ افزودن گفتگوی مستقیم</button>
             </div>
         </div>
 
@@ -239,11 +239,14 @@ HTML_INDEX = """<!DOCTYPE html>
             <div class="chat-header">
                 <div>
                     <h3 id="current-chat-title">لطفاً یک کانال یا گفتگو را انتخاب کنید</h3>
-                    <div id="current-chat-sub" style="font-size: 0.78rem; color: var(--text-muted);">رمزنگاری End-to-End اختصاصی AES-256-GCM</div>
+                    <div id="current-chat-sub" style="font-size: 0.78rem; color: var(--text-muted);">کانال‌های عمومی تلگرام و چت مستقیم</div>
                 </div>
-                <div class="crypto-badge">
-                    <span>🔒</span>
-                    <span>رمزنگاری سمت کلاینت فعال است</span>
+                <div style="display: flex; gap: 10px; align-items: center;">
+                    <button class="btn-primary" id="btn-refresh-channel" style="background:#10b981; font-size:0.8rem; padding:6px 12px; display:none; align-items:center; gap:6px;" onclick="refreshCurrentChat()">🔄 بروزرسانی کانال</button>
+                    <div class="crypto-badge">
+                        <span>🔒</span>
+                        <span>رمزنگاری سمت کلاینت فعال است</span>
+                    </div>
                 </div>
             </div>
 
@@ -263,22 +266,27 @@ HTML_INDEX = """<!DOCTYPE html>
                 <input type="text" class="input-text" id="message-input" placeholder="پیام خود را بنویسید... (ارسال با Enter)" onkeydown="if(event.key === 'Enter') sendMessage()">
                 <button class="btn-primary" id="send-btn" onclick="sendMessage()">ارسال</button>
             </div>
+
+            <div id="channel-readonly-bar" style="display: none; padding: 12px 18px; background: var(--bg-panel); border-top: 1px solid var(--border-color); color: var(--text-muted); font-size: 0.88rem; justify-content: space-between; align-items: center;">
+                <span>📢 این کانال فقط-خواندنی است (پیام‌ها از تلگرام ارسال می‌شوند).</span>
+                <button class="btn-primary" style="background:#10b981; font-size:0.82rem; padding:6px 14px;" onclick="refreshCurrentChat()">🔄 دریافت آخرین پیام‌های کانال</button>
+            </div>
         </div>
     </div>
 
-    <!-- Modal for Create/Join Channel & Chat -->
+    <!-- Modal for Direct Chat -->
     <div class="modal" id="add-modal">
         <div class="modal-card">
-            <h3 id="modal-title">عضویت یا ساخت کانال</h3>
+            <h3 id="modal-title">افزودن گفتگوی مستقیم</h3>
             <div class="form-group">
-                <label id="modal-name-label">نام کانال / شناسه چت:</label>
-                <input type="text" id="modal-name-input" placeholder="مثال: news یا dev_group">
+                <label id="modal-name-label">شناسه کاربر مخاطب:</label>
+                <input type="text" id="modal-name-input" placeholder="مثال: Alice یا Bob">
             </div>
             <div class="form-group">
-                <label id="modal-pass-label">کلید مشترک AES (رمز عبور):</label>
-                <input type="password" id="modal-pass-input" placeholder="برای کانال‌های همگانی تلگرام خالی بگذارید">
+                <label id="modal-pass-label">کلید مشترک AES (رمز عبور گفتگو):</label>
+                <input type="password" id="modal-pass-input" placeholder="رمزی که بین شما و مخاطب به اشتراک گذاشته شده">
                 <span id="modal-pass-hint" style="font-size: 0.75rem; color: var(--text-muted); margin-top: 2px;">
-                    💡 هر فردی که این رمز را وارد کند عضو گروه مشترک شده و می‌تواند پیام بخواند و ارسال کند.
+                    💡 هر فردی که این رمز را وارد کند می‌تواند پیام‌های این گفتگو را رمزگشایی و ارسال کند.
                 </span>
             </div>
             <div style="display: flex; gap: 8px; justify-content: flex-end; margin-top: 10px;">
@@ -431,6 +439,10 @@ HTML_INDEX = """<!DOCTYPE html>
             document.getElementById('tab-direct-btn').className = 'tab-btn' + (tab === 'direct' ? ' active' : '');
             currentChat = null;
             document.getElementById('input-bar').style.display = 'none';
+            document.getElementById('channel-readonly-bar').style.display = 'none';
+            document.getElementById('btn-refresh-channel').style.display = 'none';
+            document.getElementById('btn-discover-side').style.display = tab === 'channels' ? 'block' : 'none';
+            document.getElementById('btn-add-direct').style.display = tab === 'direct' ? 'block' : 'none';
             document.getElementById('current-chat-title').innerText = 'لطفاً یک گفتگو را انتخاب کنید';
             document.getElementById('messages-box').innerHTML = '<div style="text-align: center; color: var(--text-muted); margin-top: 50px;">یک چت یا کانال را انتخاب کنید</div>';
             fetchChats();
@@ -438,14 +450,43 @@ HTML_INDEX = """<!DOCTYPE html>
 
         async function selectChat(name, chatInfo) {
             currentChat = name;
-            document.getElementById('input-bar').style.display = 'flex';
-            const isPub = currentTab === 'channels' && (!chatInfo || chatInfo.is_public || !chatInfo.password);
-            const prefix = currentTab === 'channels' ? (isPub ? 'کانال عمومی: ' : 'گروه رمزدار: ') : 'کاربر: ';
+            const prefix = currentTab === 'channels' ? '📢 کانال تلگرام: ' : '👤 گفتگو با: ';
             document.getElementById('current-chat-title').innerText = prefix + name;
-            document.getElementById('current-chat-sub').innerText = isPub ? 'پخش همگانی از تلگرام (بدون رمز)' : 'رمزنگاری سرتاسری AES-256-GCM';
+            document.getElementById('current-chat-sub').innerText = currentTab === 'channels' ? 'کانال فقط-خواندنی (پیام‌ها از تلگرام ارسال می‌شوند)' : 'گفتگوی مستقیم با رمزنگاری سرتاسری AES-256-GCM';
+
+            if (currentTab === 'channels') {
+                document.getElementById('input-bar').style.display = 'none';
+                document.getElementById('channel-readonly-bar').style.display = 'flex';
+                document.getElementById('btn-refresh-channel').style.display = 'flex';
+            } else {
+                document.getElementById('input-bar').style.display = 'flex';
+                document.getElementById('channel-readonly-bar').style.display = 'none';
+                document.getElementById('btn-refresh-channel').style.display = 'none';
+            }
+
             await loadMessages();
             fetchChats();
             pollMessages();
+        }
+
+        async function refreshCurrentChat() {
+            if (!currentChat) return;
+            const btnHdr = document.getElementById('btn-refresh-channel');
+            const btns = document.querySelectorAll('#channel-readonly-bar button');
+            if (btnHdr) btnHdr.innerText = '⏳ در حال دریافت...';
+            btns.forEach(b => b.innerText = '⏳ در حال دریافت...');
+
+            try {
+                const targetParam = `?target=${encodeURIComponent(currentChat)}`;
+                await fetch('/api/poll' + targetParam, { method: 'POST' });
+                await loadMessages();
+                await fetchChats();
+            } catch(e) {
+                alert('خطا در بروزرسانی کانال: ' + e);
+            } finally {
+                if (btnHdr) btnHdr.innerText = '🔄 بروزرسانی کانال';
+                btns.forEach(b => b.innerText = '🔄 دریافت آخرین پیام‌های کانال');
+            }
         }
 
         async function loadMessages() {
@@ -618,9 +659,9 @@ HTML_INDEX = """<!DOCTYPE html>
         }
 
         function openAddChatModal() {
-            document.getElementById('modal-title').innerText = currentTab === 'channels' ? 'عضویت یا ساخت کانال' : 'افزودن گفتگوی مستقیم';
-            document.getElementById('modal-name-label').innerText = currentTab === 'channels' ? 'نام کانال:' : 'شناسه کاربر:';
-            document.getElementById('modal-pass-label').innerText = currentTab === 'channels' ? 'کلید مشترک AES (رمز عبور):' : 'کلید اشتراکی AES:';
+            document.getElementById('modal-title').innerText = 'افزودن گفتگوی مستقیم';
+            document.getElementById('modal-name-label').innerText = 'شناسه کاربر مخاطب:';
+            document.getElementById('modal-pass-label').innerText = 'کلید مشترک AES (رمز عبور گفتگو):';
             document.getElementById('modal-name-input').value = '';
             document.getElementById('modal-pass-input').value = '';
             document.getElementById('add-modal').style.display = 'flex';
@@ -629,11 +670,9 @@ HTML_INDEX = """<!DOCTYPE html>
         async function submitAddChat() {
             const name = document.getElementById('modal-name-input').value.trim();
             const pass = document.getElementById('modal-pass-input').value.trim();
-            if (!name) { alert('لطفاً نام کانال یا کاربر را وارد کنید'); return; }
-            if (currentTab === 'direct' && !pass) { alert('برای گفتگوی مستقیم، وارد کردن کلید مشترک الزامی است'); return; }
+            if (!name || !pass) { alert('شناسه کاربر و کلید رمزگذاری الزامی است'); return; }
 
-            const endpoint = currentTab === 'channels' ? '/api/channel/join' : '/api/direct/add';
-            const res = await fetch(endpoint, {
+            const res = await fetch('/api/direct/add', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({ name: name, password: pass })
@@ -646,7 +685,7 @@ HTML_INDEX = """<!DOCTYPE html>
 
             closeModal('add-modal');
             await fetchChats();
-            selectChat(name, { name: name, is_public: !pass, password: pass });
+            selectChat(name, { name: name, is_public: false, password: pass });
         }
 
         async function openSettings() {
@@ -761,13 +800,10 @@ class WebApp:
         return web.json_response(self.client.state)
 
     async def join_channel_handler(self, request):
-        data = await request.json()
-        name = str(data.get("name", "")).strip().lower()
-        password = str(data.get("password", "")).strip()
-        if name:
-            self.client.join_channel(name, password)
-            return web.json_response({"ok": True})
-        return web.json_response({"ok": False, "error": "نام کانال نمی‌تواند خالی باشد"}, status=400)
+        return web.json_response({
+            "ok": False,
+            "error": "ایجاد کانال توسط کلاینت‌ها غیرفعال است. کانال‌ها به صورت مستقیم از طریق تلگرام روی سرور مدیریت می‌شوند. لطفاً از دکمه «دریافت کانال‌های عمومی» استفاده کنید."
+        }, status=403)
 
     async def add_direct_handler(self, request):
         data = await request.json()
@@ -820,6 +856,12 @@ class WebApp:
                 file_bytes = await part.read()
 
         c_type = "channel" if chat_type in ("channel", "channels") else "direct"
+        if c_type == "channel":
+            return web.json_response({
+                "ok": False,
+                "error": "کانال‌ها فقط-خواندنی هستند و ارسال پیام توسط کلاینت در آن‌ها غیرفعال است."
+            }, status=403)
+
         ok, msg = await self.client.send_message(
             chat_type=c_type,
             target_name=target,

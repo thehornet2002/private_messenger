@@ -285,7 +285,10 @@ class DnsTunnelClient:
         file_bytes: bytes = b"",
         on_progress = None
     ) -> Tuple[bool, str]:
-        store = self.state["channels"] if chat_type == "channel" else self.state["direct"]
+        if chat_type == "channel":
+            return False, "کانال‌ها فقط-خواندنی هستند و ارسال پیام در آن‌ها توسط کلاینت مجاز نیست."
+
+        store = self.state["direct"] if chat_type == "direct" else self.state["channels"]
         target = target_name.strip().lower()
         if target not in store:
             return False, "Target not found in chats"

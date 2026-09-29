@@ -49,40 +49,47 @@ async def run_full_suite():
     assert "Public News Alert!" in pub_msg["text"]
     print(f"  -> Client received public broadcast: '{pub_msg['text']}'")
 
-    print("[4/6] Testing Private Encrypted Group Chat (AES-256-GCM)...")
+    print("[4/6] Testing Private Encrypted Direct Chat (AES-256-GCM)...")
     chan_priv = f"secret_{os.getpid()}"
     secret_pass = "UltraSecretGroupPassword123"
-    client1.join_channel(chan_priv, secret_pass)
-    ok, err = await client1.send_message("channel", chan_priv, text="Confidential Group Message")
+    client1.add_direct_chat(chan_priv, secret_pass)
+
+    # Verify clients CANNOT send messages in channels (Read-Only)
+    cant_send_chan, chan_err = await client1.send_message("channel", chan_priv, text="Unauthorized channel message")
+    assert not cant_send_chan, "Client should NOT be able to send message in channel!"
+    print("  -> Channel read-only check passed successfully!")
+
+    # Send in direct chat
+    ok, err = await client1.send_message("direct", chan_priv, text="Confidential Group Message")
     assert ok, f"Send failed: {err}"
 
     # Verify server holds ZERO plaintext on disk
-    sec_tag = get_target_tag(chan_priv, prefix="chan")
+    sec_tag = get_target_tag(chan_priv, prefix="direct")
     server_blob = GLOBAL_DISK_STORE.get_message(sec_tag, 1)
     assert server_blob is not None
     assert b"Confidential Group Message" not in server_blob, "Plaintext leaked in server storage!"
     print(f"  -> Server disk ciphertext: {server_blob[:12].hex()}... (Plaintext nowhere found)")
 
     # Client2 joins with correct password
-    client2.join_channel(chan_priv, secret_pass)
-    fetched_sec = await client2.poll_target("channel", chan_priv)
+    client2.add_direct_chat(chan_priv, secret_pass)
+    fetched_sec = await client2.poll_target("direct", chan_priv)
     assert fetched_sec == 1, "Failed to fetch private message"
-    assert client2.state["channels"][chan_priv]["messages"][-1]["text"] == "Confidential Group Message"
+    assert client2.state["direct"][chan_priv]["messages"][-1]["text"] == "Confidential Group Message"
     print("  -> Client2 decrypted group message successfully!")
 
     # Client3 joins with WRONG password -> cannot read
     client3 = DnsTunnelClient()
     client3.resolvers = ["127.0.0.1:5399"]
     client3.base_domain = "tunnel.msg.local"
-    client3.join_channel(chan_priv, "WrongPassword")
-    fetched_wrong = await client3.poll_target("channel", chan_priv)
+    client3.add_direct_chat(chan_priv, "WrongPassword")
+    fetched_wrong = await client3.poll_target("direct", chan_priv)
     assert fetched_wrong == 0, "Wrong password must not decrypt message"
     print("  -> Wrong password client rejected correctly!")
 
     print("[5/6] Testing Binary File Transfer Over DNS...")
     test_file_bytes = b"BINARY_DATA_TEST_FILE_CONTENT_" * 60
     ok, msg = await client1.send_message(
-        chat_type="channel",
+        chat_type="direct",
         target_name=chan_priv,
         text="Sending attachment",
         file_name="secret_doc.bin",
@@ -90,9 +97,9 @@ async def run_full_suite():
     )
     assert ok, f"File send failed: {msg}"
 
-    fetched_file = await client2.poll_target("channel", chan_priv)
+    fetched_file = await client2.poll_target("direct", chan_priv)
     assert fetched_file == 1, "File message pull failed"
-    file_msg = client2.state["channels"][chan_priv]["messages"][-1]
+    file_msg = client2.state["direct"][chan_priv]["messages"][-1]
     recovered_bytes = get_message_file_bytes(file_msg)
     assert recovered_bytes == test_file_bytes, "File byte mismatch!"
     print(f"  -> File '{file_msg['file_name']}' received and verified successfully!")

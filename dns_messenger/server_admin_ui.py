@@ -398,6 +398,9 @@ class ServerAdminApp:
         if m_chan and not data.get("password"):
             GLOBAL_DISK_STORE.register_public_channel(m_chan)
 
+        # Proactively fetch and store the last 100 historical messages for the newly added channel
+        asyncio.create_task(GLOBAL_TELEGRAM_BOT.sync_channel_history(data))
+
         return web.json_response({"ok": True})
 
     async def delete_mapping_handler(self, request):

@@ -58,12 +58,22 @@ class DiskMessageStore:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     target_tag TEXT NOT NULL,
                     msg_id INTEGER NOT NULL,
+                    tg_msg_id INTEGER,
                     timestamp REAL NOT NULL,
                     encrypted_data BLOB NOT NULL
                 )
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_tag_msg ON messages(target_tag, msg_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_msg_time ON messages(timestamp)")
+
+            # Migration: ensure tg_msg_id exists before creating its index
+            cur = conn.cursor()
+            cur.execute("PRAGMA table_info(messages)")
+            cols = [row[1] for row in cur.fetchall()]
+            if "tg_msg_id" not in cols:
+                conn.execute("ALTER TABLE messages ADD COLUMN tg_msg_id INTEGER")
+
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_tag_tg_msg ON messages(target_tag, tg_msg_id)")
 
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS media (
@@ -150,6 +160,13 @@ class DiskMessageStore:
         self.sync_from_config()
         return sorted(list(self.public_channels))
 
+    def has_tg_message(self, target_tag: str, tg_msg_id: int) -> bool:
+        """Check if message from Telegram is already saved to avoid duplicates."""
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT 1 FROM messages WHERE target_tag = ? AND tg_msg_id = ? LIMIT 1", (target_tag, tg_msg_id))
+            return cur.fetchone() is not None
+
     def get_next_msg_id(self, target_tag: str) -> int:
         with sqlite3.connect(self.db_path) as conn:
             cur = conn.cursor()
@@ -157,11 +174,11 @@ class DiskMessageStore:
             row = cur.fetchone()
             return (row[0] or 0) + 1
 
-    def save_message(self, target_tag: str, msg_id: int, data: bytes):
+    def save_message(self, target_tag: str, msg_id: int, data: bytes, tg_msg_id: Optional[int] = None):
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(
-                "INSERT INTO messages (target_tag, msg_id, timestamp, encrypted_data) VALUES (?, ?, ?, ?)",
-                (target_tag, msg_id, time.time(), data)
+                "INSERT INTO messages (target_tag, msg_id, tg_msg_id, timestamp, encrypted_data) VALUES (?, ?, ?, ?, ?)",
+                (target_tag, msg_id, tg_msg_id, time.time(), data)
             )
         self._purge_limit(target_tag)
         self.stats["total_messages_received"] += 1

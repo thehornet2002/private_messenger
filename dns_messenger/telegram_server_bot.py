@@ -51,9 +51,121 @@ class TelegramServerBot:
             self.is_connected = True
             self.is_running = True
             logger.info("Telegram Server Bot: Successfully connected and tracking channels.")
+            # Proactively fetch and store the last 100 messages for all tracked channels
+            asyncio.create_task(self.sync_all_channels_history())
         except Exception as e:
             logger.error(f"Telegram Server Bot start error: {e}")
             self.is_connected = False
+
+    async def sync_channel_history(self, item: dict):
+        """Fetch and store the last 100 historical messages for a channel."""
+        if not self.client or not self.is_connected:
+            return
+        cfg = load_config()
+        target_tg = str(item.get("tg_channel", "")).strip()
+        m_chan = str(item.get("messenger_channel", "general")).strip().lower()
+        m_pass = item.get("password", "").strip() or None
+        max_bytes = cfg.get("max_file_size_mb", 20) * 1024 * 1024
+        limit = int(cfg.get("channel_history_limit", 100))
+
+        if not target_tg:
+            return
+
+        logger.info(f"Telegram Server Bot: Fetching last {limit} messages from {target_tg}...")
+        try:
+            chat = await self.client.get_chat(target_tg)
+            messages = []
+            async for msg in self.client.get_chat_history(chat.id, limit=limit):
+                messages.append(msg)
+
+            # Oldest to newest
+            messages.reverse()
+            saved_cnt = 0
+            chat_title = chat.title or target_tg
+            for msg in messages:
+                saved = await self._process_and_save_message(msg, m_chan, m_pass, max_bytes, chat_title)
+                if saved:
+                    saved_cnt += 1
+            logger.info(f"Telegram Server Bot: Synced {saved_cnt}/{len(messages)} historical messages for '{m_chan}' from {target_tg}")
+        except Exception as e:
+            logger.error(f"Failed to fetch history for {target_tg}: {e}")
+
+    async def sync_all_channels_history(self):
+        """Fetch and store the last 100 messages for all tracked channels on startup."""
+        cfg = load_config()
+        tg_cfg = cfg.get("kurigram_tracker", {})
+        channels_map = tg_cfg.get("channels_map", [])
+        for item in channels_map:
+            await self.sync_channel_history(item)
+
+    async def _process_and_save_message(
+        self,
+        message: Message,
+        m_chan: str,
+        m_pass: Optional[str],
+        max_bytes: int,
+        chat_title: str
+    ) -> bool:
+        """Process a single Telegram message (live or historical) and store on disk."""
+        tag = get_target_tag(m_chan, prefix="chan")
+        if message.id and GLOBAL_DISK_STORE.has_tg_message(tag, message.id):
+            return False  # Already stored, prevent duplicate
+
+        text = message.text or message.caption or ""
+        if not text and not message.photo and not message.video and not message.document and not message.audio and not message.voice:
+            return False
+
+        sender_title = f"📢 Telegram [{chat_title}]"
+        full_text = f"{sender_title}\n\n{text}".strip()
+
+        file_name = ""
+        file_bytes = b""
+        media_type = ""
+
+        if message.photo:
+            media_type = "photo"
+            file_name = "photo.jpg"
+        elif message.video:
+            media_type = "video"
+            file_name = getattr(message.video, "file_name", "video.mp4") or "video.mp4"
+        elif message.document and message.document.file_size <= max_bytes:
+            media_type = "document"
+            file_name = message.document.file_name or "document.bin"
+        elif message.audio or message.voice:
+            media_type = "audio"
+            file_name = "audio.ogg"
+
+        if media_type:
+            try:
+                dl_path = await message.download()
+                if dl_path and os.path.exists(dl_path):
+                    with open(dl_path, "rb") as f:
+                        file_bytes = f.read()
+                    os.remove(dl_path)
+            except Exception as dl_err:
+                logger.warning(f"Error downloading media for msg {message.id}: {dl_err}")
+
+        is_public = (m_pass is None)
+        if is_public:
+            GLOBAL_DISK_STORE.register_public_channel(m_chan)
+
+        new_id = GLOBAL_DISK_STORE.get_next_msg_id(tag)
+        if file_bytes:
+            GLOBAL_DISK_STORE.save_media(tag, new_id, file_bytes)
+
+        packed = pack_message(
+            sender=sender_title,
+            text=full_text,
+            file_name=file_name,
+            file_bytes=b"",
+            is_public=is_public,
+            media_type=media_type,
+            media_size=len(file_bytes),
+            has_media=bool(file_bytes)
+        )
+        encrypted_data = encrypt_payload(packed, password=m_pass)
+        GLOBAL_DISK_STORE.save_message(tag, new_id, encrypted_data, tg_msg_id=message.id)
+        return True
 
     def _register_handlers(self, cfg: dict):
         tg_cfg = cfg.get("kurigram_tracker", {})
@@ -73,65 +185,11 @@ class TelegramServerBot:
                 target_tg = str(item.get("tg_channel", "")).strip().lower()
                 if target_tg in (chat_user, chat_id):
                     m_chan = item.get("messenger_channel", "general").strip().lower()
-                    m_pass = item.get("password", "").strip() or None  # None = Public unencrypted
-
-                    text = message.text or message.caption or ""
-                    sender_title = f"📢 Telegram [{message.chat.title or target_tg}]"
-                    full_text = f"{sender_title}\n\n{text}".strip()
-
-                    file_name = ""
-                    file_bytes = b""
-                    media_type = ""
+                    m_pass = item.get("password", "").strip() or None
                     max_bytes = cfg.get("max_file_size_mb", 20) * 1024 * 1024
-
-                    if message.photo:
-                        media_type = "photo"
-                        file_name = "photo.jpg"
-                    elif message.video:
-                        media_type = "video"
-                        file_name = getattr(message.video, "file_name", "video.mp4") or "video.mp4"
-                    elif message.document and message.document.file_size <= max_bytes:
-                        media_type = "document"
-                        file_name = message.document.file_name or "document.bin"
-                    elif message.audio or message.voice:
-                        media_type = "audio"
-                        file_name = "audio.ogg"
-
-                    if media_type:
-                        dl_path = await message.download()
-                        if dl_path and os.path.exists(dl_path):
-                            with open(dl_path, "rb") as f:
-                                file_bytes = f.read()
-                            os.remove(dl_path)
-
-                    is_public = (m_pass is None)
-                    if is_public:
-                        GLOBAL_DISK_STORE.register_public_channel(m_chan)
-
-                    tag = get_target_tag(m_chan, prefix="chan")
-                    new_id = GLOBAL_DISK_STORE.get_next_msg_id(tag)
-
-                    # Store media in disk storage with 4-hour retention
-                    if file_bytes:
-                        GLOBAL_DISK_STORE.save_media(tag, new_id, file_bytes)
-
-                    # Message payload contains metadata without heavy bytes
-                    packed = pack_message(
-                        sender=sender_title,
-                        text=full_text,
-                        file_name=file_name,
-                        file_bytes=b"",
-                        is_public=is_public,
-                        media_type=media_type,
-                        media_size=len(file_bytes),
-                        has_media=bool(file_bytes)
-                    )
-                    encrypted_data = encrypt_payload(packed, password=m_pass)
-
-                    # Save to server disk storage (4-hour retention)
-                    GLOBAL_DISK_STORE.save_message(tag, new_id, encrypted_data)
-                    logger.info(f"Telegram Server Bot: Forwarded post from {target_tg} to '{m_chan}' (Media: {media_type}, Size: {len(file_bytes)}B, Public: {is_public})")
-                    logger.info(f"Telegram Server Bot: Forwarded post from {target_tg} to '{m_chan}' (Public: {is_public})")
+                    chat_title = message.chat.title or target_tg
+                    await self._process_and_save_message(message, m_chan, m_pass, max_bytes, chat_title)
+                    logger.info(f"Telegram Server Bot: Forwarded live post from {target_tg} to '{m_chan}'")
 
     # Interactive Authentication API
     async def request_code(self, api_id: int, api_hash: str, phone_number: str) -> dict:

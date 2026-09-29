@@ -97,12 +97,23 @@ async def run_full_suite():
     assert recovered_bytes == test_file_bytes, "File byte mismatch!"
     print(f"  -> File '{file_msg['file_name']}' received and verified successfully!")
 
-    print("[6/7] Checking Disk Persistence (SQLite WAL & Auto-Prune)...")
+    print("[6/7] Checking Disk Persistence (SQLite WAL & 100-Message Limit)...")
     assert GLOBAL_DISK_STORE.db_path.exists(), "server_storage.db must exist on disk!"
     with sqlite3.connect(GLOBAL_DISK_STORE.db_path) as conn:
         row_cnt = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
         assert row_cnt > 0, "Messages must be persisted on disk!"
         print(f"  -> Total messages persisted on disk in SQLite: {row_cnt}")
+
+    # Test limit: insert messages past history limit (e.g. limit=100)
+    chan_limit = f"limittest_{os.getpid()}"
+    lim_tag = get_target_tag(chan_limit, prefix="chan")
+    for i in range(105):
+        m_id = GLOBAL_DISK_STORE.get_next_msg_id(lim_tag)
+        GLOBAL_DISK_STORE.save_message(lim_tag, m_id, b"chunk_payload")
+    with sqlite3.connect(GLOBAL_DISK_STORE.db_path) as conn:
+        stored_cnt = conn.execute("SELECT COUNT(*) FROM messages WHERE target_tag = ?", (lim_tag,)).fetchone()[0]
+        assert stored_cnt == 100, f"Expected exactly 100 messages retained, got {stored_cnt}"
+        print(f"  -> 100-Message Limit Verified! (105 inserted -> exactly {stored_cnt} retained)")
     print("  -> Disk Persistence & Storage Architecture Verified!")
 
     print("[7/7] Testing Channel Auto-Discovery & On-Demand Media Pull (Autodownload OFF)...")

@@ -93,8 +93,8 @@ DEFAULT_CONFIG = {
     "server_listen_port": 5354,  # Use 53 if standalone, or 5354 to coexist with MasterDNS
     "forward_dns_upstream": "127.0.0.1:53",  # Transparent forward for MasterDNS queries if port 53 is used
     
-    # Storage and Retention Settings (Disk-backed with 4-Hour TTL)
-    "retention_hours": 4,  # Automatically purge messages and media from disk after 4 hours
+    # Storage and History Settings (Disk-backed with 100-message limit per channel)
+    "channel_history_limit": 100,  # Automatically retain the last 100 messages per channel on disk
     "max_file_size_mb": 20,
     "chunk_size_bytes": 110,  # Optimal for base32 labels within 253-byte DNS domain
     

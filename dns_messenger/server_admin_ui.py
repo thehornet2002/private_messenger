@@ -392,6 +392,12 @@ class ServerAdminApp:
             cfg["kurigram_tracker"]["channels_map"] = []
         cfg["kurigram_tracker"]["channels_map"].append(data)
         save_config(cfg)
+        
+        # Register public channel in server store
+        m_chan = str(data.get("messenger_channel", "")).strip().lower()
+        if m_chan and not data.get("password"):
+            GLOBAL_DISK_STORE.register_public_channel(m_chan)
+
         return web.json_response({"ok": True})
 
     async def delete_mapping_handler(self, request):
@@ -402,6 +408,7 @@ class ServerAdminApp:
         if 0 <= idx < len(m_list):
             m_list.pop(idx)
             save_config(cfg)
+            GLOBAL_DISK_STORE.sync_from_config(cfg)
         return web.json_response({"ok": True})
 
     async def tg_request_code_handler(self, request):

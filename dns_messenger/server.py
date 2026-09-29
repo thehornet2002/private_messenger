@@ -31,13 +31,13 @@ CHUNK_PULL_SIZE = 380
 
 class DiskMessageStore:
     """
-    Disk-backed SQLite Store with 4-Hour Retention Window.
+    Disk-backed SQLite Store with 100-message history limit per channel.
     Messages and media are stored on disk in data/server_storage.db and automatically
-    pruned after retention_hours (default: 4 hours = 14400 seconds).
+    pruned to keep the last 100 messages per channel/tag.
     """
-    def __init__(self, db_path: Path, ttl_seconds: int = 14400):
+    def __init__(self, db_path: Path, history_limit: int = 100):
         self.db_path = db_path
-        self.ttl = ttl_seconds
+        self.history_limit = history_limit
         self.public_channels: set = set()
         self._init_db()
         self.stats = {
@@ -87,11 +87,49 @@ class DiskMessageStore:
             for row in cur.fetchall():
                 self.public_channels.add(row[0])
 
-    def _purge_expired(self):
-        cutoff = time.time() - self.ttl
+        self.sync_from_config()
+
+    def sync_from_config(self, cfg: Optional[dict] = None):
+        """Sync public channels from config.json into database and memory."""
+        try:
+            if cfg is None:
+                cfg = load_config()
+            tg_map = cfg.get("kurigram_tracker", {}).get("channels_map", [])
+            with sqlite3.connect(self.db_path) as conn:
+                for item in tg_map:
+                    if not item.get("password"):
+                        cname = str(item.get("messenger_channel", "")).strip().lower()
+                        if cname:
+                            self.public_channels.add(cname)
+                            conn.execute(
+                                "INSERT OR REPLACE INTO public_channels (channel_name, updated_at) VALUES (?, ?)",
+                                (cname, time.time())
+                            )
+        except Exception:
+            pass
+
+    def _purge_limit(self, target_tag: str):
+        """Retain only the newest self.history_limit messages for this target_tag."""
         with sqlite3.connect(self.db_path) as conn:
-            conn.execute("DELETE FROM messages WHERE timestamp < ?", (cutoff,))
-            conn.execute("DELETE FROM media WHERE timestamp < ?", (cutoff,))
+            conn.execute("""
+                DELETE FROM messages
+                WHERE target_tag = ?
+                  AND id NOT IN (
+                      SELECT id FROM messages
+                      WHERE target_tag = ?
+                      ORDER BY msg_id DESC
+                      LIMIT ?
+                  )
+            """, (target_tag, target_tag, self.history_limit))
+
+            # Prune orphaned media records
+            conn.execute("""
+                DELETE FROM media
+                WHERE (target_tag, msg_id) NOT IN (
+                    SELECT target_tag, msg_id FROM messages
+                )
+            """)
+
             cur = conn.cursor()
             cur.execute("SELECT COUNT(DISTINCT target_tag) FROM messages")
             row = cur.fetchone()
@@ -99,12 +137,18 @@ class DiskMessageStore:
 
     def register_public_channel(self, channel_name: str):
         cname = channel_name.strip().lower()
+        if not cname:
+            return
         self.public_channels.add(cname)
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO public_channels (channel_name, updated_at) VALUES (?, ?)",
                 (cname, time.time())
             )
+
+    def get_public_channels(self) -> List[str]:
+        self.sync_from_config()
+        return sorted(list(self.public_channels))
 
     def get_next_msg_id(self, target_tag: str) -> int:
         with sqlite3.connect(self.db_path) as conn:
@@ -114,17 +158,16 @@ class DiskMessageStore:
             return (row[0] or 0) + 1
 
     def save_message(self, target_tag: str, msg_id: int, data: bytes):
-        self._purge_expired()
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(
                 "INSERT INTO messages (target_tag, msg_id, timestamp, encrypted_data) VALUES (?, ?, ?, ?)",
                 (target_tag, msg_id, time.time(), data)
             )
+        self._purge_limit(target_tag)
         self.stats["total_messages_received"] += 1
         self.stats["total_bytes_transferred"] += len(data)
 
     def save_media(self, target_tag: str, msg_id: int, data: bytes):
-        self._purge_expired()
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO media (target_tag, msg_id, timestamp, media_data) VALUES (?, ?, ?, ?)",
@@ -133,7 +176,6 @@ class DiskMessageStore:
         self.stats["total_bytes_transferred"] += len(data)
 
     def get_media(self, target_tag: str, msg_id: int) -> Optional[bytes]:
-        self._purge_expired()
         with sqlite3.connect(self.db_path) as conn:
             cur = conn.cursor()
             cur.execute("SELECT media_data FROM media WHERE target_tag = ? AND msg_id = ?", (target_tag, msg_id))
@@ -141,7 +183,6 @@ class DiskMessageStore:
             return row[0] if row else None
 
     def get_messages_after(self, target_tag: str, last_seen_id: int, limit: int = 1) -> List[Tuple[int, bytes]]:
-        self._purge_expired()
         with sqlite3.connect(self.db_path) as conn:
             cur = conn.cursor()
             cur.execute(
@@ -151,7 +192,6 @@ class DiskMessageStore:
             return cur.fetchall()
 
     def get_message(self, target_tag: str, msg_id: int) -> Optional[bytes]:
-        self._purge_expired()
         with sqlite3.connect(self.db_path) as conn:
             cur = conn.cursor()
             cur.execute(
@@ -167,7 +207,7 @@ class DiskMessageStore:
 # Global disk store for server runtime
 GLOBAL_DISK_STORE = DiskMessageStore(
     DATA_DIR / "server_storage.db",
-    ttl_seconds=int(load_config().get("retention_hours", 4)) * 3600
+    history_limit=int(load_config().get("channel_history_limit", 100))
 )
 
 class DnsTunnelServerProtocol(asyncio.DatagramProtocol):
@@ -387,7 +427,7 @@ async def run_server():
     print(f"DNS Messenger Server active on UDP {host}:{port}")
     print(f"Server Web Admin Panel: http://{admin_host}:{admin_port}")
     print(f"Base Domain: {cfg.get('base_domain')}")
-    print(f"Storage Architecture: Disk-backed SQLite (data/server_storage.db with 4-Hour Retention)")
+    print(f"Storage Architecture: Disk-backed SQLite (data/server_storage.db with 100-message channel history)")
     print("=======================================================\n")
 
     try:

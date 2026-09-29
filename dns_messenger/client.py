@@ -330,64 +330,76 @@ class DnsTunnelClient:
         return True, "Message sent successfully"
 
     # Polling & Pulling Messages
-    async def poll_target(self, chat_type: str, target_name: str) -> int:
-        """Poll server for new messages on a specific target. Returns count of new messages fetched."""
+    async def poll_target(self, chat_type: str, target_name: str, max_batch: int = 100) -> int:
+        """Poll server for new messages on a specific target. Fetches all unread messages up to max_batch."""
         store = self.state["channels"] if chat_type == "channel" else self.state["direct"]
         if target_name not in store:
             return 0
 
         chat_info = store[target_name]
         tag = chat_info["tag"]
-        password = chat_info["password"]
+        password = chat_info.get("password", "").strip() or None
         last_seen = chat_info.get("last_seen_id", 0)
 
-        # 1. Ask server for metadata of next message
-        poll_pkt = DnsPacket(PKT_POLL_META, target_tag=tag, msg_id=last_seen)
-        meta_resp = await self.send_dns_packet(poll_pkt)
-        if not meta_resp or meta_resp.pkt_type != PKT_META_RESP or meta_resp.msg_id == 0:
-            return 0
+        fetched_count = 0
+        while fetched_count < max_batch:
+            # 1. Ask server for metadata of next message
+            poll_pkt = DnsPacket(PKT_POLL_META, target_tag=tag, msg_id=last_seen)
+            meta_resp = await self.send_dns_packet(poll_pkt)
+            if not meta_resp or meta_resp.pkt_type != PKT_META_RESP or meta_resp.msg_id == 0:
+                break
 
-        next_msg_id = meta_resp.msg_id
-        total_chunks = meta_resp.total_chunks
+            next_msg_id = meta_resp.msg_id
+            total_chunks = meta_resp.total_chunks
 
-        # 2. Pull all chunks of this message
-        chunks = {}
-        for c_idx in range(total_chunks):
-            pull_pkt = DnsPacket(
-                PKT_PULL_CHUNK,
-                target_tag=tag,
-                msg_id=next_msg_id,
-                chunk_idx=c_idx,
-                total_chunks=total_chunks
-            )
-            resp = await self.send_dns_packet(pull_pkt)
-            if not resp or resp.pkt_type != PKT_CHUNK_RESP:
-                return 0  # retry next cycle
-            chunks[c_idx] = resp.payload
+            # 2. Pull all chunks of this message
+            chunks = {}
+            pull_failed = False
+            for c_idx in range(total_chunks):
+                pull_pkt = DnsPacket(
+                    PKT_PULL_CHUNK,
+                    target_tag=tag,
+                    msg_id=next_msg_id,
+                    chunk_idx=c_idx,
+                    total_chunks=total_chunks
+                )
+                resp = await self.send_dns_packet(pull_pkt)
+                if not resp or resp.pkt_type != PKT_CHUNK_RESP:
+                    pull_failed = True
+                    break
+                chunks[c_idx] = resp.payload
 
-        if len(chunks) != total_chunks:
-            return 0
+            if pull_failed or len(chunks) != total_chunks:
+                break
 
-        full_encrypted = b"".join(chunks[i] for i in range(total_chunks))
-        res = decrypt_payload(full_encrypted, password)
-        if not res:
-            # Password mismatch or corrupted
-            chat_info["last_seen_id"] = next_msg_id
-            self.save_state()
-            return 0
+            full_encrypted = b"".join(chunks[i] for i in range(total_chunks))
+            res = decrypt_payload(full_encrypted, password)
+            if not res:
+                # Password mismatch or corrupted
+                chat_info["last_seen_id"] = next_msg_id
+                self.save_state()
+                last_seen = next_msg_id
+                fetched_count += 1
+                continue
 
-        raw_bytes, is_pub = res
-        try:
-            msg_obj = unpack_message(raw_bytes)
-            msg_obj["msg_id"] = next_msg_id
-            msg_obj["is_public"] = is_pub
-            msg_obj["timestamp"] = int(time.time())
-            chat_info["messages"].append(msg_obj)
-            chat_info["last_seen_id"] = next_msg_id
-            self.save_state()
-            return 1
-        except Exception:
-            return 0
+            raw_bytes, is_pub = res
+            try:
+                msg_obj = unpack_message(raw_bytes)
+                msg_obj["msg_id"] = next_msg_id
+                msg_obj["is_public"] = is_pub
+                msg_obj["timestamp"] = int(time.time())
+                chat_info["messages"].append(msg_obj)
+                # Keep last 100 messages locally
+                if len(chat_info["messages"]) > 100:
+                    chat_info["messages"] = chat_info["messages"][-100:]
+                chat_info["last_seen_id"] = next_msg_id
+                self.save_state()
+                last_seen = next_msg_id
+                fetched_count += 1
+            except Exception:
+                break
+
+        return fetched_count
 
     async def poll_all(self, target_priority: Optional[str] = None):
         """Poll active channels and direct chats. If target_priority is specified, poll that first."""
@@ -423,7 +435,7 @@ class DnsTunnelClient:
             self.stats["is_polling"] = False
 
     async def discover_public_channels(self) -> List[str]:
-        """Ask server for active public broadcast channels over DNS."""
+        """Ask server for active public broadcast channels over DNS and auto-join them."""
         pkt = DnsPacket(PKT_DISCOVER_CHANNELS)
         resp = await self.send_dns_packet(pkt)
         if not resp or resp.pkt_type != PKT_CHANNELS_RESP or not resp.payload:
@@ -432,8 +444,12 @@ class DnsTunnelClient:
             chans = json.loads(resp.payload.decode("utf-8"))
             for c in chans:
                 c_name = str(c).strip().lower()
-                if c_name and c_name not in self.state["channels"]:
-                    self.join_channel(c_name, password="")
+                if c_name:
+                    if c_name not in self.state["channels"]:
+                        self.join_channel(c_name, password="")
+                    else:
+                        self.state["channels"][c_name]["is_public"] = True
+            self.save_state()
             return chans
         except Exception:
             return []

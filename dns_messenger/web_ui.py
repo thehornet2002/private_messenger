@@ -212,6 +212,7 @@ HTML_INDEX = """<!DOCTYPE html>
             </div>
         </div>
         <div class="header-actions">
+            <button class="btn-primary" style="background:#2563eb;" id="btn-discover-hdr" onclick="requestPublicChannels()">📡 دریافت کانال‌های عمومی</button>
             <button class="btn-outline" onclick="pollMessages()">🔄 همگام‌سازی DNS</button>
             <button class="btn-outline" onclick="openSettings()">⚙️ تنظیمات</button>
         </div>
@@ -227,8 +228,9 @@ HTML_INDEX = """<!DOCTYPE html>
             <div class="chat-list" id="chat-list">
                 <!-- Dynamically populated -->
             </div>
-            <div class="sidebar-bottom">
-                <button class="btn-primary" style="width: 100%;" onclick="openAddChatModal()">➕ ایجاد یا عضویت</button>
+            <div class="sidebar-bottom" style="display: flex; flex-direction: column; gap: 8px;">
+                <button class="btn-primary" style="width: 100%; background: #2563eb;" id="btn-discover-side" onclick="requestPublicChannels()">📡 دریافت کانال‌های عمومی از سرور</button>
+                <button class="btn-outline" style="width: 100%;" onclick="openAddChatModal()">➕ ایجاد یا عضویت دستی</button>
             </div>
         </div>
 
@@ -329,7 +331,7 @@ HTML_INDEX = """<!DOCTYPE html>
             await discoverChannels();
             setInterval(fetchStatus, 4000);
             setInterval(pollMessages, 6000);
-            setInterval(discoverChannels, 15000);
+            setInterval(discoverChannels, 20000);
         }
 
         async function discoverChannels() {
@@ -340,6 +342,33 @@ HTML_INDEX = """<!DOCTYPE html>
                     await fetchChats();
                 }
             } catch(e) {}
+        }
+
+        async function requestPublicChannels() {
+            const btn1 = document.getElementById('btn-discover-hdr');
+            const btn2 = document.getElementById('btn-discover-side');
+            if (btn1) btn1.innerText = 'در حال استعلام DNS...';
+            if (btn2) btn2.innerText = 'در حال استعلام DNS...';
+
+            try {
+                const res = await fetch('/api/channels/discover', { method: 'POST' });
+                const data = await res.json();
+                const chans = data.channels || [];
+                await fetchChats();
+                if (chans.length > 0) {
+                    alert('✅ کانال‌های عمومی سرور با موفقیت از DNS دریافت و افزوده شدند:\\n' + chans.join('\\n'));
+                    if (!currentChat && chans.length > 0) {
+                        selectChat(chans[0], { name: chans[0], is_public: true, password: '' });
+                    }
+                } else {
+                    alert('هیچ کانال عمومی فعالی از سرور دریافت نشد. در صورت تمایل می‌توانید از پنل مدیریت سرور کانال اضافه کنید.');
+                }
+            } catch(e) {
+                alert('خطا در استعلام کانال‌ها از سرور: ' + e);
+            } finally {
+                if (btn1) btn1.innerText = '📡 دریافت کانال‌های عمومی';
+                if (btn2) btn2.innerText = '📡 دریافت کانال‌های عمومی از سرور';
+            }
         }
 
         async function fetchStatus() {
